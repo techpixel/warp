@@ -1,0 +1,23 @@
+{
+  "name": "warp",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "dev": "vite",
+    "build": "vite build"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "dependencies": {
+    "gifenc": "^1.0.3",
+    "linkedom": "^0.18.13",
+    "svg-path-commander": "^2.3.3"
+  },
+  "devDependencies": {
+    "vite": "^8.3.4"
+  }
+}

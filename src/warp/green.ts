@@ -1,35 +1,31 @@
-import { Vector2D } from "../vector.lib";
-
-export function interp(point: Vector2D, icage: Vector2D[], dcage: Vector2D[], log: (log: any) => void = (a) => {}) {
-    var phi: number[] = new Array(icage.length).fill(0);
-    var psi: number[] = new Array(icage.length).fill(0);
+export function weights(x: number, y: number, rest: Float64Array, log: (log: any) => void = (a) => {}) {
+    var n = rest.length / 2;
+    var w = new Float64Array(2 * n);
 
     var A = 0;
-    var D = 0;
-    for (var i = 0; i < icage.length; i++) {
-        var ni = (i + 1) % icage.length;
-        A += icage[i].i * icage[ni].j - icage[ni].i * icage[i].j;
-        D += dcage[i].i * dcage[ni].j - dcage[ni].i * dcage[i].j;
+    for (var i = 0; i < n; i++) {
+        var ni = (i + 1) % n;
+        A += rest[2 * i] * rest[2 * ni + 1] - rest[2 * ni] * rest[2 * i + 1];
     }
-    
+
     var Aw = Math.sign(A);
-    var Dw = Math.sign(D);
 
     log(Aw);
 
-    for (var i = 0; i < icage.length; i++) {
-        var ni = (i + 1) % icage.length;
+    for (var i = 0; i < n; i++) {
+        var ni = (i + 1) % n;
 
-        var a = icage[ni].sub(icage[i]);
-        var b = icage[i].sub(point);
-        
-        var Q = a.dot(a);
-        var S = b.dot(b);
-        var R = a.scale(2).dot(b);
+        var ax = rest[2 * ni] - rest[2 * i];
+        var ay = rest[2 * ni + 1] - rest[2 * i + 1];
+        var bx = rest[2 * i] - x;
+        var by = rest[2 * i + 1] - y;
 
-        var n = (new Vector2D(Aw * a.j, -1 * Aw * a.i)).scale(1 / a.norm());
-        var BA = b.dot(n.scale(a.norm())) * -1;
-        // var BA = b.det(a);
+        var Q = ax * ax + ay * ay;
+        var S = bx * bx + by * by;
+        var R = 2 * (ax * bx + ay * by);
+
+        var an = Math.sqrt(Q);
+        var BA = -Aw * (bx * ay - by * ax);
 
         var SRT = Math.sqrt(4 * S * Q - (R**2));
 
@@ -42,35 +38,48 @@ export function interp(point: Vector2D, icage: Vector2D[], dcage: Vector2D[], lo
         var A10 = A1 - A0;
         var L10 = L1 - L0;
 
-        psi[i] = (-1 * a.norm() / (4 * Math.PI)) * (
+        var psi = (-1 * an / (4 * Math.PI)) * (
             (4 * S - (R ** 2 / Q)) * A10 +
             (R / (2 * Q)) * L10 +
             L1 - 2
-        )
-        phi[ni] = phi[ni] - (
+        );
+        w[n + i] = psi / an;
+
+        w[ni] = w[ni] - (
             (BA / (2 * Math.PI)) * ((L10/(2*Q)) - (A10 * (R/Q)))
         );
 
-        phi[i] = phi[i] + (
+        w[i] = w[i] + (
             (BA / (2 * Math.PI)) * ((L10/(2*Q)) - (A10 * (2 + (R/Q))))
         );
     }
 
-    var cb = new Vector2D();
-    for (var i = 0; i < icage.length; i++) {
-        cb = cb.add(dcage[i].scale(phi[i]));
+    log(w.subarray(0, n));
+
+    return w;
+}
+
+export function deformer(rest: Float64Array, moved: Float64Array, log: (log: any) => void = (a) => {}) {
+    var n = moved.length / 2;
+
+    var D = 0;
+    for (var i = 0; i < n; i++) {
+        var ni = (i + 1) % n;
+        D += moved[2 * i] * moved[2 * ni + 1] - moved[2 * ni] * moved[2 * i + 1];
     }
 
-    var kb = new Vector2D();
-    for (var i = 0; i < icage.length; i++) {
-        var ni = (i + 1) % icage.length;
-        var a = dcage[ni].sub(dcage[i]);
-        var n = (new Vector2D(Dw * a.j, -1 * Dw * a.i)).scale(1 / a.norm());
-        var sj = dcage[i].dist(dcage[ni]) / icage[i].dist(icage[ni]); 
-        kb = kb.add(n.scale(psi[i]).scale(sj));
-    }    
+    var Dw = Math.sign(D);
 
-    log(phi);
-
-    return cb.add(kb);
+    return (w: Float64Array, out: Float64Array) => {
+        var x = 0;
+        var y = 0;
+        for (var i = 0; i < n; i++) {
+            var ni = (i + 1) % n;
+            var c = Dw * w[n + i];
+            x += w[i] * moved[2 * i] + c * (moved[2 * ni + 1] - moved[2 * i + 1]);
+            y += w[i] * moved[2 * i + 1] - c * (moved[2 * ni] - moved[2 * i]);
+        }
+        out[0] = x;
+        out[1] = y;
+    };
 }

@@ -1,12 +1,29 @@
-import { Vector2D } from "../vector.lib";
+export { weights } from "./mvc";
 
-// ai generated perspective correction of the mvc
+function normalize(pts: Float64Array): Float64Array {
+    var n = pts.length / 2;
+    var cx = 0;
+    var cy = 0;
+    for (var k = 0; k < n; k++) {
+        cx += pts[2 * k];
+        cy += pts[2 * k + 1];
+    }
+    cx = cx * (1 / n);
+    cy = cy * (1 / n);
 
-function normalize(pts: Vector2D[]): Vector2D[] {
-    var c = pts.reduce((a, q) => a.add(q), new Vector2D()).scale(1 / pts.length);
-    var d = pts.reduce((a, q) => a + q.dist(c), 0) / pts.length;
+    var d = 0;
+    for (var k = 0; k < n; k++) {
+        d += Math.sqrt((pts[2 * k] - cx) ** 2 + (pts[2 * k + 1] - cy) ** 2);
+    }
+    d = d / n;
+
     var s = d > 0 ? Math.SQRT2 / d : 1;
-    return pts.map((q) => q.sub(c).scale(s));
+    var out = new Float64Array(pts.length);
+    for (var k = 0; k < n; k++) {
+        out[2 * k] = (pts[2 * k] - cx) * s;
+        out[2 * k + 1] = (pts[2 * k + 1] - cy) * s;
+    }
+    return out;
 }
 
 function solve(A: number[][], b: number[]): number[] | null {
@@ -32,7 +49,7 @@ function solve(A: number[][], b: number[]): number[] | null {
     return x;
 }
 
-function homography(src: Vector2D[], dst: Vector2D[]): number[] | null {
+function homography(src: Float64Array, dst: Float64Array): number[] | null {
     var MtM = Array.from({ length: 8 }, () => new Array(8).fill(0));
     var Mtb = new Array(8).fill(0);
     var add = (row: number[], rhs: number) => {
@@ -42,75 +59,48 @@ function homography(src: Vector2D[], dst: Vector2D[]): number[] | null {
         }
     };
 
-    for (var k = 0; k < src.length; k++) {
-        var x = src[k].i, y = src[k].j, u = dst[k].i, v = dst[k].j;
+    for (var k = 0; k < src.length / 2; k++) {
+        var x = src[2 * k], y = src[2 * k + 1], u = dst[2 * k], v = dst[2 * k + 1];
         add([x, y, 1, 0, 0, 0, -u * x, -u * y], u);
         add([0, 0, 0, x, y, 1, -v * x, -v * y], v);
     }
     return solve(MtM, Mtb);
 }
 
-function depths(icage: Vector2D[], dcage: Vector2D[]): number[] {
-    var flat = icage.map(() => 1);
-    if (icage.length < 4) return flat; 
+function depths(rest: Float64Array, moved: Float64Array): Float64Array {
+    var n = rest.length / 2;
+    var flat = new Float64Array(n).fill(1);
+    if (n < 4) return flat;
 
-    var src = normalize(icage);
-    var H = homography(src, normalize(dcage));
+    var src = normalize(rest);
+    var H = homography(src, normalize(moved));
     if (!H) return flat;
 
-    var z = src.map((q) => H![6] * q.i + H![7] * q.j + 1);
-    if (!z.every((zi) => Number.isFinite(zi) && zi > 1e-9)) return flat;
+    var z = new Float64Array(n);
+    for (var k = 0; k < n; k++) {
+        z[k] = H[6] * src[2 * k] + H[7] * src[2 * k + 1] + 1;
+        if (!Number.isFinite(z[k]) || z[k] <= 1e-9) return flat;
+    }
     return z;
 }
 
-export function interp(point: Vector2D, icage: Vector2D[], dcage: Vector2D[], log: (log: any) => void = (a) => {}) {
-    var s: Vector2D[] = [];
-    var r: number[] = [];
-    var A: number[] = [];
-    var D: number[] = [];
-    var z = depths(icage, dcage);
+export function deformer(rest: Float64Array, moved: Float64Array, log: (log: any) => void = (a) => {}) {
+    var n = moved.length / 2;
+    var z = depths(rest, moved);
 
-    log({ z });
+    log({ z: Array.from(z) });
 
-    for (var i = 0; i < icage.length; i++) {
-        s[i] = icage[i].sub(point);
-        log(s[i]);
-    }
-
-    for (var i = 0; i < icage.length; i++) {
-        var ni = (i + 1) % icage.length;
-        r[i] = s[i].norm();
-        A[i] = s[i].det(s[ni])/2;
-        D[i] = s[i].dot(s[ni]);
-        if (r[i] == 0) return dcage[i];
-        if (A[i] == 0 && D[i] < 0) {
-            r[ni] = s[ni].norm();
-
-            var wi = r[ni] * z[i];
-            var wn = r[i] * z[ni];
-            var itm = dcage[i].scale(wi).add(dcage[ni].scale(wn));
-
-            return itm.scale(1/(wi+wn));
+    return (w: Float64Array, out: Float64Array) => {
+        var x = 0;
+        var y = 0;
+        var W = 0;
+        for (var i = 0; i < n; i++) {
+            var wz = w[i] * z[i];
+            x += wz * moved[2 * i];
+            y += wz * moved[2 * i + 1];
+            W += wz;
         }
-    }
-
-    var f = new Vector2D();
-    var W = 0;
-
-    for (var i = 0; i < icage.length; i++) {
-        var ni = (i + 1) % icage.length;
-        var bi = ((i - 1 + icage.length) % icage.length);
-        var w = 0;
-        if (A[bi] != 0) {
-            w = w + (r[bi] - (D[bi]/r[i]))/A[bi];
-        }
-        if (A[i] != 0) {
-            w = w + (r[ni] - (D[i]/r[i]))/A[i];
-        }
-        w = w * z[i];
-        f = f.add(dcage[i].scale(w));
-        W = W + w;
-    }
-
-    return f.scale(1/W);
+        out[0] = x / W;
+        out[1] = y / W;
+    };
 }

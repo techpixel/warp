@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">
+  <rect x="10" y="10" width="30" height="20" rx="4" fill="tomato"/>
+  <circle cx="70" cy="30" r="15" fill="teal"/>
+  <polygon points="50,60 80,90 20,90" fill="gold" stroke="black"/>
+  <path d="M10 50 q 20 -20 40 0 t 40 0" fill="none" stroke="blue"/>
+</svg>
