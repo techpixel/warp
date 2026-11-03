@@ -1,18 +1,21 @@
 <script lang="ts">
+  import { tick } from "svelte";
   import { cubicOut } from "svelte/easing";
   import { flip } from "svelte/animate";
   import { scale, slide } from "svelte/transition";
   import Button from "#lib/components/Button.svelte";
   import Checkbox from "#lib/components/Checkbox.svelte";
+  import Logo from "#lib/components/Logo.svelte";
   import Slider from "#lib/components/Slider.svelte";
   import Stage from "#lib/components/Stage.svelte";
   import Submenu from "#lib/components/Submenu.svelte";
   import WarpPass from "#lib/components/WarpPass.svelte";
   import { methods, PERSPECTIVE_METHOD } from "#lib/editor.svelte.js";
   import { connectFigma, inFigma, requestSelection } from "#lib/figma.js";
-  import { Passes } from "#lib/passes.svelte.js";
+  import { tug } from "#lib/flutter.js";
+  import { hold } from "#lib/hold.js";
+  import { MAX_PASSES, Passes } from "#lib/passes.svelte.js";
   import { PRESETS, THUMB_VIEWBOX, thumbnailLines } from "#lib/presets.js";
-  import logo from "#lib/assets/icons/logo.svg";
   import plus from "#lib/assets/icons/plus.svg";
 
   const passes = new Passes();
@@ -29,6 +32,31 @@
    * above it ride up with its top edge. Same timing as a pass scaling in.
    */
   const SLIDE_UP = { duration: EASE_MS, easing: cubicOut };
+  /**
+   * The settings panel sits at the bottom of the sidebar, so when its height
+   * changes, its top edge moves: it slides there (with the same timing) instead
+   * of jumping. A change mid-slide carries on from where the panel is.
+   */
+  const slideOnResize = (el: HTMLElement) => {
+    const born = performance.now();
+    let last = 0;
+    const observer = new ResizeObserver(([entry]) => {
+      const h = entry.borderBoxSize[0].blockSize, grew = h - last;
+      last = h;
+      // Its intro (SLIDE_UP) covers its first EASE_MS.
+      if (!grew || !EASE_MS || performance.now() - born < EASE_MS) return;
+      const now = getComputedStyle(el).transform;
+      const from = (now === "none" ? 0 : new DOMMatrix(now).m42) + grew;
+      for (const a of el.getAnimations()) if (a.id === "settle") a.cancel();
+      el.animate([{ transform: `translateY(${from}px)` }, { transform: "none" }], {
+        id: "settle",
+        duration: EASE_MS,
+        easing: "cubic-bezier(0.33, 1, 0.68, 1)", // cubicOut
+      });
+    });
+    observer.observe(el);
+    return () => observer.disconnect();
+  };
   const editor = $derived(passes.current);
   let fileInput = $state<HTMLInputElement>();
   let cageInput = $state<HTMLInputElement>();
@@ -71,6 +99,16 @@
     editor.methodId === PERSPECTIVE_METHOD ? TYPE_TILES.map((t) => (t.value === "quad" ? PERSPECTIVE_TILE : t)) : TYPE_TILES,
   );
   const SHOWN_PRESETS = PRESETS.slice(0, 5);
+
+  // The controls' heights, measured. The panel keeps room for the tallest set (so it
+  // doesn't jump between passes), but as blank space that gives way before anything
+  // scrolls when the window is short.
+  let perspH = $state(0), slidersH = $state(0), slotH = $state(0);
+  const SLIDERS_GAP = 8; // matches .sliders
+  const controlsH = $derived(
+    editor.perspective ? perspH : slidersH - (editor.methodId === "hybrid" ? 0 : slotH + SLIDERS_GAP),
+  );
+  const reserveH = $derived(Math.max(perspH, slidersH) - controlsH);
   const moreItems = PRESETS.slice(5).map((p) => ({ value: p.id, label: p.label }));
   const moreChosen = $derived(moreItems.some((i) => i.value === editor.cageChoice));
 
@@ -83,23 +121,51 @@
   }
 
   // Dragging a pass by its grip moves it up or down the list, a row at a time.
-  const PASS_STEP = 46; // a row and the gap below it
+  const PASS_STEP = 40; // a row and the gap below it
+  const PAST_END = 128; // how far a pass is pulled past the first or last row before the wave creeps in
+  const SIDEWAYS = 32; // how far it's pulled sideways before it stretches
+  // Tugged where it can't go (sideways, or past the top or bottom of the list,
+  // as a lone pass always is), it gives a little and settles when let go (see flutter.ts).
+  /** The pass being dragged to a new spot, by id, which lifts a little meanwhile. */
+  let lifted = $state<number | null>(null);
   function grabPass(e: PointerEvent, i: number) {
     let at = i, startY = e.clientY;
+    const id = passes.list[i]?.id ?? null;
+    const grip = e.currentTarget as HTMLElement;
+    const pass = grip.closest<HTMLElement>(".pass");
+    const give = pass && EASE_MS ? tug(pass) : null;
     passes.select(i);
+    // Captured, so the drag keeps every move until the button comes up, wherever the pointer
+    // goes. Reordering can move the grip's own node, which drops the capture, so it's taken
+    // again after each move, and the window (which hears either way) does the listening.
+    const capture = () => {
+      try { if (grip.isConnected) grip.setPointerCapture(e.pointerId); } catch {}
+    };
+    capture();
     const move = (ev: PointerEvent) => {
-      const to = Math.max(0, Math.min(passes.list.length - 1, at + Math.round((ev.clientY - startY) / PASS_STEP)));
+      if (ev.pointerId !== e.pointerId) return;
+      const last = passes.list.length - 1;
+      const dy = ev.clientY - startY;
+      const pastEnd = at === 0 && dy < -PAST_END ? dy + PAST_END : at === last && dy > PAST_END ? dy - PAST_END : 0;
+      const sideways = Math.max(0, Math.abs(ev.clientX - e.clientX) - SIDEWAYS);
+      if (sideways || pastEnd) give?.pull(sideways, pastEnd);
+      else give?.release();
+      if (last > 0 && Math.abs(ev.clientY - e.clientY) > 4) lifted = id;
+      const to = Math.max(0, Math.min(last, at + Math.round(dy / PASS_STEP)));
       if (to === at) return;
       passes.move(at, to);
       startY += (to - at) * PASS_STEP;
       at = to;
-    };
-    const up = () => {
-      window.removeEventListener("pointermove", move);
-      window.removeEventListener("pointerup", up);
+      tick().then(capture);
     };
     window.addEventListener("pointermove", move);
-    window.addEventListener("pointerup", up);
+    // Captured above (and again after each reorder), so `hold` doesn't capture or end on losing it.
+    hold(grip, e, () => {
+      window.removeEventListener("pointermove", move);
+      if (grip.hasPointerCapture(e.pointerId)) grip.releasePointerCapture(e.pointerId);
+      give?.release();
+      lifted = null;
+    }, false);
   }
 
   function onkeydown(e: KeyboardEvent) {
@@ -133,20 +199,21 @@
   onpointerdowncapture={() => editor.gesture(true)}
   onpointerupcapture={() => editor.gesture(false)}
   onpointercancelcapture={() => editor.gesture(false)}
+  onpointermovecapture={(e) => e.buttons === 0 && editor.gesture(false)}
 />
 
 <div class="app">
   <aside>
     <div class="top">
       <header>
-        <img src={logo} width="105" height="24" alt="Warp" />
+        <Logo />
         <button
           type="button"
           class="new"
           aria-label="Add a warp pass"
           aria-haspopup="menu"
           aria-expanded={menu?.kind === "method"}
-          disabled={!passes.base.kind}
+          disabled={!passes.base.kind || passes.list.length >= MAX_PASSES}
           onclick={(e) => openMenu("method", e)}
         >
           <img src={plus} width="24" height="24" alt="" />
@@ -156,8 +223,10 @@
       <!-- Always present (even empty), so the first pass is added to it and scales in like the rest. -->
       <div class="passes" role="listbox" aria-label="Warp passes">
         {#each passes.list as pass, i (pass.id)}
-          <!-- Scales in when added, and back out when deleted; the others slide into place. -->
+          <!-- Scales in when added, and back out when deleted; the others slide into place.
+               Lifts a little while it's dragged to a new spot. -->
           <div
+            class={{ lifted: lifted === pass.id }}
             animate:flip={{ duration: EASE_MS, easing: cubicOut }}
             transition:scale={{ start: 0.8, duration: EASE_MS, easing: cubicOut }}
           >
@@ -201,6 +270,7 @@
     {#if passes.active !== null}
       <section
         in:slide={SLIDE_UP}
+        {@attach slideOnResize}
         class="settings"
         aria-label="Pass settings"
         style:--accent={editor.method?.color}
@@ -273,10 +343,14 @@
           />
         </div>
 
-        <!-- Every method's controls are laid out in one spot (only the current one shown),
-             so the panel is always as tall as the tallest and never jumps between passes. -->
-        <div class="controls">
-          <div class={["variant", "persp", { hidden: !editor.perspective }]} inert={!editor.perspective}>
+        <!-- Every method's controls are laid out in one spot (only the current one shown) to be
+             measured; the box shows just the current one, and .reserve makes up the rest. -->
+        <div class="controls" style:height={perspH || slidersH ? `${controlsH}px` : undefined}>
+          <div
+            class={["variant", "persp", { hidden: !editor.perspective }]}
+            inert={!editor.perspective}
+            bind:offsetHeight={perspH}
+          >
           <Slider
             id="perspective-strength"
             label="Perspective strength"
@@ -305,8 +379,16 @@
             {/each}
           </div>
           </div>
-          <div class={["variant", "sliders", { hidden: editor.perspective }]} inert={editor.perspective}>
-            <div class={["slot", { hidden: editor.methodId !== "hybrid" }]} inert={editor.methodId !== "hybrid"}>
+          <div
+            class={["variant", "sliders", { hidden: editor.perspective }]}
+            inert={editor.perspective}
+            bind:offsetHeight={slidersH}
+          >
+            <div
+              class={["slot", { hidden: editor.methodId !== "hybrid" }]}
+              inert={editor.methodId !== "hybrid"}
+              bind:offsetHeight={slotH}
+            >
               <Slider
                 id="hybrid"
                 label="Green Mix"
@@ -348,6 +430,7 @@
             </div>
           </div>
         </div>
+        <div class="reserve" style:flex-basis="{reserveH}px"></div>
       </section>
     {/if}
   </aside>
@@ -419,21 +502,18 @@
     background: var(--panel);
     border-radius: 0 16px 16px 0;
   }
+  /* The top (the passes) always shows in full; when the window is too short,
+     the settings below it give way and scroll instead. */
   .top {
     display: flex;
-    flex: 1;
+    flex: 1 0 auto;
     flex-direction: column;
-    min-height: 0;
-    overflow-y: auto;
-    padding: 20px 24px 24px;
+    padding: 16px 24px;
   }
   header {
     display: flex;
     align-items: center;
     justify-content: space-between;
-  }
-  header > img {
-    display: block;
   }
   .new {
     display: flex;
@@ -461,22 +541,35 @@
   .passes {
     display: flex;
     flex-direction: column;
-    gap: 12px;
-    margin-top: 24px;
+    gap: 8px;
+    margin-top: 16px;
+  }
+  .passes > div {
+    position: relative;
+    transition: scale var(--ease);
+  }
+  /* Above the others, as it's carried over them. */
+  .passes > .lifted {
+    z-index: 1;
+    scale: 1.03;
   }
   .actions {
     display: flex;
-    gap: 8px;
+    gap: 6px;
     margin-top: auto;
-    padding-top: 24px;
+    padding-top: 16px;
   }
   .settings {
     display: flex;
-    flex: none;
+    flex: 0 1 auto;
+    min-height: 0;
+    overflow-y: auto;
     flex-direction: column;
-    gap: 16px;
-    padding: 24px 24px 48px;
+    gap: 12px;
+    padding: 16px 24px 24px;
     background: var(--accent);
+    /* Fills in below while it slides up into a shorter height (see slideOnResize). */
+    box-shadow: 0 100vh 0 0 var(--accent);
     transition: background-color var(--ease);
     /* Everything in the panel is drawn in the color that reads on its method's accent. */
     --ink: var(--on-accent, #fff);
@@ -489,7 +582,7 @@
     display: flex;
     align-items: center;
     gap: 7px;
-    font-size: 16px;
+    font-size: 14px;
     line-height: 1;
   }
   /* A 1px rule in the panel's line color, so it reads on every method's accent. */
@@ -501,11 +594,11 @@
   .tiles {
     display: grid;
     grid-template-columns: repeat(3, 1fr);
-    gap: 8px;
+    gap: 6px;
   }
   .tiles button {
-    height: 58px;
-    padding: 6px;
+    height: 44px;
+    padding: 5px;
     color: var(--ink);
     background: none;
     border: 1px solid var(--line);
@@ -550,18 +643,35 @@
   }
   .row {
     display: flex;
-    gap: 8px;
+    gap: 6px;
+  }
+  /* The sidebar's buttons, a size down from Button's default. */
+  .actions > :global(.button),
+  .row > :global(.button) {
+    padding: 5px 8px;
+    font-size: 14px;
   }
   .sliders {
     display: flex;
     flex-direction: column;
     gap: 8px;
   }
+  /* Clipped to the current controls; the taller hidden set would otherwise make it scroll. */
   .controls {
     display: grid;
+    overflow: clip;
+    overflow-clip-margin: 4px; /* room for focus rings */
   }
   .variant {
     grid-area: 1 / 1;
+    align-self: start;
+  }
+  /* The rest of the tallest set's room, which shrinks away first. Its negative margin
+     cancels the panel's gap, so at 0px it takes no space. */
+  .reserve {
+    flex-shrink: 1;
+    min-height: 0;
+    margin-top: -12px;
   }
   .hidden {
     visibility: hidden;
@@ -573,7 +683,7 @@
   .persp {
     display: flex;
     flex-direction: column;
-    gap: 16px;
+    gap: 12px;
   }
   .sliders > :global(.slider),
   .slot > :global(.slider) {
@@ -636,7 +746,7 @@
       overflow-y: auto;
     }
     .tiles button {
-      height: 44px;
+      height: 36px;
     }
   }
 </style>

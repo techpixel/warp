@@ -6,6 +6,7 @@
   import { cagePath, edgePoint, insidePoly, nearestT, type Pt } from "#lib/cage.js";
   import { meshLines } from "#lib/mesh.js";
   import { drawMesh } from "#lib/raster.js";
+  import { hold } from "#lib/hold.js";
   import type { Editor, LinkTarget } from "#lib/editor.svelte.js";
 
   // `bare`: just the artwork, with no cage (no warp pass is selected).
@@ -90,6 +91,19 @@
       for (let j = 1; j <= parts; j++) d += `L${at(onEdge([a[0] + ((b[0] - a[0]) * j) / parts, a[1] + ((b[1] - a[1]) * j) / parts]))}`;
     }
     return d + "Z";
+  });
+  // What the mouse does in the cage editor, shown while there's no notice. A mesh
+  // cage keeps its grid, so it can't take new edge points or connectors.
+  type Gesture = "drag" | "double" | "right";
+  const hints = $derived.by((): [Gesture, string][] => {
+    const mesh = !!editor.inner?.dims;
+    return [
+      ["drag", "Move a point"],
+      ...(mesh ? [] : [["double", "Add a point on an edge"]] as [Gesture, string][]),
+      ["double", "Add a center point inside the cage"],
+      ...(mesh ? [] : [["double", "Connect a point, then click where to"]] as [Gesture, string][]),
+      ["right", "Remove a point or connector"],
+    ];
   });
   const solid = $derived(editor.active);
   /** Every draggable point: the cage's, then a Mesh cage's inner ones. */
@@ -304,6 +318,7 @@
     return { t: found, axis };
   }
 
+
   function grab(e: PointerEvent, i: number) {
     if (e.button !== 0) return;
     e.stopPropagation();
@@ -323,7 +338,6 @@
     else if (!editor.selected.includes(i)) editor.select(i, false);
     if (!editor.selected.includes(i)) return;
     const handle = e.currentTarget as SVGCircleElement;
-    handle.setPointerCapture(e.pointerId);
     const [x, y] = toSvg(e), p = points[i];
     const offset: Pt = [p[0] - x, p[1] - y];
     const moving = new Set(editor.dragGroup(i));
@@ -336,10 +350,10 @@
       editor.dragPoint(i, snap(i, [mx + offset[0], my + offset[1]], moving));
     };
     handle.addEventListener("pointermove", move);
-    handle.addEventListener("lostpointercapture", () => {
+    hold(handle, e, () => {
       handle.removeEventListener("pointermove", move);
       align = [];
-    }, { once: true });
+    });
   }
 
   // Window listeners rather than pointer capture, so a double-click still reaches the knob.
@@ -352,12 +366,8 @@
       const [mx, my] = toSvg(ev);
       editor.moveCtrl(edge, which, [mx + offset[0], my + offset[1]]);
     };
-    const up = () => {
-      window.removeEventListener("pointermove", move);
-      window.removeEventListener("pointerup", up);
-    };
     window.addEventListener("pointermove", move);
-    window.addEventListener("pointerup", up);
+    hold(e.currentTarget as Element, e, () => window.removeEventListener("pointermove", move), false);
   }
 
   // Dragging empty canvas draws a selection rectangle (shift adds to the
@@ -372,7 +382,6 @@
     const orbiting = editor.perspective && e.button === 0 && !spaceHeld;
     const start = [e.clientX, e.clientY];
     let last = start, moved = false;
-    svg.setPointerCapture(e.pointerId);
     panning = true;
     const move = (ev: PointerEvent) => {
       moved ||= Math.hypot(ev.clientX - start[0], ev.clientY - start[1]) > 3;
@@ -382,16 +391,15 @@
       last = [ev.clientX, ev.clientY];
     };
     svg.addEventListener("pointermove", move);
-    svg.addEventListener("lostpointercapture", () => {
+    hold(svg, e, () => {
       svg.removeEventListener("pointermove", move);
       panning = false;
       if (!moved && e.button === 0) editor.selected = [];
-    }, { once: true });
+    });
   }
 
   function select(e: PointerEvent) {
     const from = toSvg(e), add = e.shiftKey, before = editor.selected;
-    svg.setPointerCapture(e.pointerId);
     const move = (ev: PointerEvent) => {
       const to = toSvg(ev);
       // Starts once the pointer has moved a few screen pixels.
@@ -403,12 +411,12 @@
       editor.selected = add ? [...new Set([...before, ...inside])] : inside;
     };
     svg.addEventListener("pointermove", move);
-    svg.addEventListener("lostpointercapture", () => {
+    hold(svg, e, () => {
       svg.removeEventListener("pointermove", move);
       if (!marquee && !add) editor.selected = [];
       editor.selectedGuide = null;
       marquee = null;
-    }, { once: true });
+    });
   }
 
   /** Space held down turns a drag into a pan (outside text fields). */
@@ -454,7 +462,7 @@
   <svg
     bind:this={svg}
     {@attach wheelZoom}
-    class={{ panning, orbit: editor.perspective && !spaceHeld, "space-pan": spaceHeld }}
+    class={["board", { panning, orbit: editor.perspective && !spaceHeld, "space-pan": spaceHeld }]}
     viewBox="{view.x} {view.y} {view.w} {view.h}"
     xmlns="http://www.w3.org/2000/svg"
     role="application"
@@ -583,7 +591,28 @@
     {/if}
   </svg>
 
-  <p class="status" aria-live="polite">{bare ? "" : editor.status}</p>
+  {#snippet mouse(gesture: Gesture)}
+    <!-- A mouse with the pressed button filled: twice for a double-click, with an arrow for a drag. -->
+    <svg class="gesture" width="20" height="16" viewBox="0 0 20 16" aria-hidden="true">
+      <rect x="1.5" y="1.5" width="9" height="13" rx="4.5" />
+      <path d="M6 1.5v5M1.5 6.5h9" />
+      <path class="pressed" d={gesture === "right" ? "M6 1.5a4.5 4.5 0 0 1 4.5 4.5v.5H6z" : "M6 1.5a4.5 4.5 0 0 0-4.5 4.5v.5H6z"} />
+      {#if gesture === "double"}
+        <text x="13" y="11">2</text>
+      {:else if gesture === "drag"}
+        <path d="M13 8h6m-2-2 2 2-2 2" />
+      {/if}
+    </svg>
+  {/snippet}
+  {#if !bare && editor.editing && !editor.status}
+    <ul class="status hints" aria-label="Cage editor controls">
+      {#each hints as [gesture, text] (text)}
+        <li>{@render mouse(gesture)}{text}</li>
+      {/each}
+    </ul>
+  {:else}
+    <p class="status" aria-live="polite">{bare ? "" : editor.status}</p>
+  {/if}
 
   <div class="zoom">
     <button type="button" aria-label="Zoom out" onclick={() => editor.zoomBy(1 / 1.25)}>−</button>
@@ -605,7 +634,7 @@
     outline-offset: -12px;
   }
   canvas,
-  svg {
+  .board {
     position: absolute;
     inset: 0;
     width: 100%;
@@ -614,18 +643,18 @@
   canvas {
     pointer-events: none;
   }
-  svg {
+  .board {
     display: block;
     touch-action: none;
     cursor: crosshair;
   }
-  svg.space-pan {
+  .board.space-pan {
     cursor: grab;
   }
-  svg.panning {
+  .board.panning {
     cursor: grabbing;
   }
-  svg.orbit {
+  .board.orbit {
     cursor: move;
   }
   .marquee {
@@ -794,6 +823,35 @@
     font-size: 12px;
     color: var(--muted);
     pointer-events: none;
+  }
+  .hints {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px 16px;
+    padding: 0;
+    list-style: none;
+  }
+  .hints li {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+  }
+  .gesture {
+    flex: none;
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 1;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+  }
+  .gesture .pressed {
+    fill: currentColor;
+    stroke: none;
+  }
+  .gesture text {
+    fill: currentColor;
+    stroke: none;
+    font-size: 9px;
   }
   .zoom {
     position: absolute;

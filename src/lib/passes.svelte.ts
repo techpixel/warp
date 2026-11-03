@@ -9,6 +9,7 @@ import { Editor, PERSPECTIVE_METHOD } from "./editor.svelte";
 type WarpPass = { id: number; editor: Editor; stop: () => void };
 
 const DEFAULT_METHOD = "mvc"; // the pass new artwork starts with
+export const MAX_PASSES = 4;
 
 export class Passes {
   base = new Editor();
@@ -19,9 +20,9 @@ export class Passes {
   /** The editor the canvas and settings show: the selected pass, else the bare artwork. */
   current = $derived(this.active === null ? this.base : (this.list[this.active]?.editor ?? this.base));
 
-  /** Adds a pass using method `methodId` after the others, and selects it. */
+  /** Adds a pass using method `methodId` after the others (up to MAX_PASSES), and selects it. */
   add(methodId: string) {
-    if (!this.base.kind) return;
+    if (!this.base.kind || this.list.length >= MAX_PASSES) return;
     const editor = new Editor();
     const prev = this.list.at(-1)?.editor;
     editor.setMethod(methodId);

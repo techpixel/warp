@@ -91,12 +91,12 @@
     display: flex;
     align-items: center;
     justify-content: space-between;
-    height: 34px;
-    padding: 0 10px;
+    height: 32px;
+    padding: 0 8px;
     color: var(--pass-muted);
     border: 1px solid var(--pass-muted);
     border-radius: 8px;
-    font-size: 16px;
+    font-size: 14px;
     cursor: pointer;
     user-select: none;
     transition: color var(--ease), border-color var(--ease), background-color var(--ease);

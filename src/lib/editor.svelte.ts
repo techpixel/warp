@@ -1,5 +1,5 @@
-import { parsePathString, pathToCurve, shapeToPathArray } from "svg-path-commander/util";
-import { SHAPES, collectCurves, contentBBox, mapPoints, subdivide, warpSvgElement } from "./warp-core.js";
+import { pathToCurve } from "svg-path-commander/util";
+import { SHAPES, collectCurves, contentBBox, mapPoints, shapeToPath, subdivide, warpSvgElement } from "./warp-core.js";
 import { alphaBounds, drawMesh, gridBounds, warpGrid, type Texture } from "./raster";
 import {
   type Box, type Ctrl, type Pt,
@@ -1216,7 +1216,7 @@ function samplePaths(root: SVGSVGElement) {
 
 /** A cage from the first subpath of an SVG shape: one vertex per segment, Bezier controls kept. */
 function cageFromShape(el: Element): { pts: Pt[]; ctrl: Ctrl[] } | null {
-  const pathArray = el.tagName.toLowerCase() === "path" ? parsePathString(el.getAttribute("d") || "") : shapeToPathArray(el as any) || null;
+  const pathArray = (shapeToPath(el) || null) as Parameters<typeof pathToCurve>[0] | null;
   if (!pathArray?.length) return null;
   const curve = pathToCurve(pathArray) as unknown as (string | number)[][];
   if (curve[0]?.[0] !== "M") return null;

@@ -12,13 +12,36 @@ export const SHAPES = ["path", "rect", "circle", "ellipse", "line", "polyline", 
 // Attributes that only make sense on the original shape, not on a <path>.
 const SHAPE_ATTRS = ["x", "y", "width", "height", "rx", "ry", "cx", "cy", "r", "x1", "y1", "x2", "y2", "points"];
 
+/**
+ * Any shape element as a PathArray (or false). Rounded rects are drawn with
+ * arcs here: svg-path-commander builds their corners from `s` commands, whose
+ * first control point pathToCurve reflects off the preceding straight edge,
+ * so a long edge flings its corner far past the rect.
+ */
+export function shapeToPath(el) {
+  const tag = el.tagName.toLowerCase();
+  if (tag === "path") return parsePathString(el.getAttribute("d") || "");
+  if (tag !== "rect") return shapeToPathArray(el);
+  const num = (name) => parseFloat(el.getAttribute(name) || "0") || 0;
+  const x = num("x"), y = num("y"), w = num("width"), h = num("height");
+  // A missing rx or ry takes the other's value (SVG spec); both clamp to half the side.
+  const rxAttr = el.getAttribute("rx"), ryAttr = el.getAttribute("ry");
+  const rx = Math.min(num(rxAttr != null ? "rx" : "ry"), w / 2);
+  const ry = Math.min(num(ryAttr != null ? "ry" : "rx"), h / 2);
+  if (!(rx > 0 && ry > 0)) return [["M", x, y], ["h", w], ["v", h], ["H", x], ["Z"]];
+  return [
+    ["M", x + rx, y], ["h", w - 2 * rx], ["a", rx, ry, 0, 0, 1, rx, ry],
+    ["v", h - 2 * ry], ["a", rx, ry, 0, 0, 1, -rx, ry],
+    ["h", 2 * rx - w], ["a", rx, ry, 0, 0, 1, -rx, -ry],
+    ["v", 2 * ry - h], ["a", rx, ry, 0, 0, 1, rx, -ry], ["Z"],
+  ];
+}
+
 /** Every drawable shape under `root`, as [element, CurveArray]. */
 export function collectCurves(root) {
   const out = [];
   for (const el of root.querySelectorAll(SHAPES.join(","))) {
-    const pathArray = el.tagName.toLowerCase() === "path"
-      ? parsePathString(el.getAttribute("d") || "")
-      : shapeToPathArray(el);
+    const pathArray = shapeToPath(el);
     if (pathArray && pathArray.length) out.push([el, pathToCurve(pathArray)]);
   }
   return out;

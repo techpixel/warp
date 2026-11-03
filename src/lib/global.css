@@ -29,4 +29,13 @@ body {
   background-color: var(--bg);
   color: var(--ink);
   font: 400 16px/normal "Familjen Grotesk", system-ui, sans-serif;
+  /* An app, not a page: labels and buttons don't select. */
+  -webkit-user-select: none;
+  user-select: none;
+}
+/* What's typed in still selects as usual. */
+input,
+textarea {
+  -webkit-user-select: text;
+  user-select: text;
 }
