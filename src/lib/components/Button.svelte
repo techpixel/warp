@@ -1,6 +1,7 @@
 <!--
   The sidebar's outlined text button. With `pressed` set it's a toggle,
   filled while on. With `attention`, it blinks to say it's the thing to do next.
+  `primary` fills it with the ink color (black on white), for the main action.
 -->
 <script lang="ts">
   import type { Snippet } from "svelte";
@@ -11,16 +12,18 @@
     pressed,
     disabled = false,
     attention = false,
+    primary = false,
   }: {
     children: Snippet;
     onclick: (e: MouseEvent) => void;
     pressed?: boolean;
     disabled?: boolean;
     attention?: boolean;
+    primary?: boolean;
   } = $props();
 </script>
 
-<button type="button" class={["button", { attention }]} aria-pressed={pressed} {disabled} {onclick}>
+<button type="button" class={["button", { attention, primary }]} aria-pressed={pressed} {disabled} {onclick}>
   {@render children()}
 </button>
 
@@ -42,6 +45,13 @@
   }
   .button:hover:not(:disabled) {
     background: var(--hover);
+  }
+  .primary {
+    color: var(--panel);
+    background: var(--ink);
+  }
+  .primary:hover:not(:disabled) {
+    background: color-mix(in srgb, var(--ink) 85%, var(--panel));
   }
   .button[aria-pressed="true"],
   .button[aria-pressed="true"]:hover {

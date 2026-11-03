@@ -1,7 +1,7 @@
 {
   "extends": "$app/tsconfig",
   "include": ["src", "*"],
-  "exclude": ["src/service-worker"],
+  "exclude": ["src/service-worker", "src/figma/code.ts"],
   "compilerOptions": {
     "allowJs": true,
     "checkJs": false,

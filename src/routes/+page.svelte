@@ -9,12 +9,17 @@
   import Submenu from "#lib/components/Submenu.svelte";
   import WarpPass from "#lib/components/WarpPass.svelte";
   import { methods, PERSPECTIVE_METHOD } from "#lib/editor.svelte.js";
+  import { connectFigma, inFigma, requestSelection } from "#lib/figma.js";
   import { Passes } from "#lib/passes.svelte.js";
   import { PRESETS, THUMB_VIEWBOX, thumbnailLines } from "#lib/presets.js";
   import logo from "#lib/assets/icons/logo.svg";
   import plus from "#lib/assets/icons/plus.svg";
 
   const passes = new Passes();
+  // In the Figma plugin, the selected layer is the artwork, and exports go back onto the canvas.
+  /** In Figma: a layer is selected that hasn't been imported yet, so Import selection pulses. */
+  let selectionReady = $state(false);
+  if (inFigma) connectFigma((file) => passes.load(file), (ready) => (selectionReady = ready));
 
   // Motion takes the CSS `--ease` duration (300ms), and is skipped for reduced motion.
   const reducedMotion = typeof matchMedia === "function" && matchMedia("(prefers-reduced-motion: reduce)").matches;
@@ -171,10 +176,15 @@
       </div>
 
       <div class="actions">
-        <Button attention={!passes.base.kind} onclick={() => fileInput?.click()}>Open…</Button>
-        <Button disabled={!passes.base.kind} onclick={() => passes.export()}>
-          Export {passes.base.kind === "image" ? "PNG" : "SVG"}
-        </Button>
+        {#if inFigma}
+          <Button attention={selectionReady} onclick={requestSelection}>Import selection</Button>
+          <Button primary disabled={!passes.base.kind} onclick={() => passes.export()}>Place</Button>
+        {:else}
+          <Button attention={!passes.base.kind} onclick={() => fileInput?.click()}>Open…</Button>
+          <Button disabled={!passes.base.kind} onclick={() => passes.export()}>
+            Export {passes.base.kind === "image" ? "PNG" : "SVG"}
+          </Button>
+        {/if}
         <input
           bind:this={fileInput}
           type="file"

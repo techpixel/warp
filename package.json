@@ -6,7 +6,8 @@
     "dev": "vite dev",
     "build": "vite build",
     "preview": "vite preview",
-    "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json"
+    "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json && tsc -p src/figma",
+    "build:figma": "vite build --config figma/vite.ui.config.js --mode figma && vite build --config figma/vite.code.config.js"
   },
   "keywords": [],
   "author": "",
@@ -19,13 +20,15 @@
     "svg-path-commander": "^2.3.3"
   },
   "devDependencies": {
+    "@figma/plugin-typings": "^1.142.0",
     "@sveltejs/adapter-static": "^4.0.1",
     "@sveltejs/kit": "^3.1.1",
     "@sveltejs/vite-plugin-svelte": "^7.3.1",
     "svelte": "^5.57.3",
     "svelte-check": "^4.7.8",
     "typescript": "^6.0.3",
-    "vite": "^8.3.4"
+    "vite": "^8.3.4",
+    "vite-plugin-singlefile": "^2.3.4"
   },
   "imports": {
     "#lib/*": "./src/lib/*"

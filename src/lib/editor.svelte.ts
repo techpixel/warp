@@ -9,6 +9,7 @@ import {
 import { MESH, type Dims, gridNodes, innerRC, meshInner } from "./mesh";
 import { panelWarp } from "./panels";
 import { pullField } from "./pull";
+import { saveFile } from "./save";
 import { PRESETS, layoutCage, type Layout, type Preset } from "./presets";
 
 export const SUBDIVISIONS = 4; // pieces per cubic before warping SVG paths
@@ -1088,7 +1089,7 @@ export class Editor {
       out.removeAttribute("width");
       out.removeAttribute("height");
     }
-    download(new Blob([new XMLSerializer().serializeToString(out)], { type: "image/svg+xml" }), `${this.fileName}.svg`);
+    saveFile(new Blob([new XMLSerializer().serializeToString(out)], { type: "image/svg+xml" }), `${this.fileName}.svg`);
   }
 
   #exportPng() {
@@ -1102,7 +1103,7 @@ export class Editor {
       height: Math.max(1, Math.ceil(box.h * density)),
     });
     drawMesh(canvas.getContext("2d")!, texture, grid, ([x, y]) => [(x - box.x) * density, (y - box.y) * density]);
-    canvas.toBlob((blob) => blob && download(blob, `${this.fileName}.png`), "image/png");
+    canvas.toBlob((blob) => blob && saveFile(blob, `${this.fileName}.png`), "image/png");
   }
 
   /**
@@ -1120,7 +1121,7 @@ export class Editor {
   <path id="cage-deformed" d="${cagePath(moved, movedCtrl)}" fill="none" stroke="#000" vector-effect="non-scaling-stroke" />
 </svg>
 `;
-    download(new Blob([svg], { type: "image/svg+xml" }), `${this.fileName}-cage.svg`);
+    saveFile(new Blob([svg], { type: "image/svg+xml" }), `${this.fileName}-cage.svg`);
   }
 
   // -------------------------------------------------------------- view
@@ -1190,12 +1191,6 @@ function segmentCrossing(a: Pt, b: Pt, p: Pt, q: Pt): Pt | null {
 
 /** The point `k` of the way from `r` to `p` (beyond 1 overshoots, negative goes the other way). */
 const scaleFrom = (r: Pt, p: Pt, k: number): Pt => [r[0] + k * (p[0] - r[0]), r[1] + k * (p[1] - r[1])];
-
-function download(blob: Blob, name: string) {
-  const a = Object.assign(document.createElement("a"), { href: URL.createObjectURL(blob), download: name });
-  a.click();
-  URL.revokeObjectURL(a.href);
-}
 
 /** Points along every shape (8 per curve segment), as flat [x0, y0, …]. */
 function samplePaths(root: SVGSVGElement) {
