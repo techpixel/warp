@@ -1,37 +1,9 @@
-// Raster mode: rasterize the SVG once, then warp it as a textured triangle mesh.
-// Only needs the forward map (rest → deformed), so any interp function works.
+// Images are warped as a textured triangle mesh. Only needs the forward map
+// (rest → deformed), so any warp method works.
 
 type Pt = [number, number];
 export type Region = { x: number; y: number; w: number; h: number };
 export type Texture = { image: CanvasImageSource; region: Region; width: number; height: number };
-
-/** Renders `root` cropped to `region` (SVG units) into a bitmap, longest side `maxPx`. */
-export async function rasterize(root: SVGSVGElement, region: Region, maxPx: number): Promise<Texture> {
-  const scale = maxPx / Math.max(region.w, region.h);
-  const width = Math.max(1, Math.round(region.w * scale));
-  const height = Math.max(1, Math.round(region.h * scale));
-
-  const clone = root.cloneNode(true) as SVGSVGElement;
-  clone.setAttribute("xmlns", "http://www.w3.org/2000/svg");
-  clone.setAttribute("viewBox", `${region.x} ${region.y} ${region.w} ${region.h}`);
-  clone.setAttribute("width", String(width));
-  clone.setAttribute("height", String(height));
-  clone.setAttribute("preserveAspectRatio", "none");
-
-  const url = URL.createObjectURL(new Blob([new XMLSerializer().serializeToString(clone)], { type: "image/svg+xml" }));
-  try {
-    const img = new Image(width, height);
-    img.src = url;
-    await img.decode();
-    const canvas = document.createElement("canvas");
-    canvas.width = width;
-    canvas.height = height;
-    canvas.getContext("2d")!.drawImage(img, 0, 0, width, height);
-    return { image: canvas, region, width, height };
-  } finally {
-    URL.revokeObjectURL(url);
-  }
-}
 
 /** Warps every grid vertex of the texture's region; returns an (n+1)×(n+1) grid in SVG units. */
 export function warpGrid(tex: Texture, n: number, deform: (p: Pt) => Pt): Pt[][] {

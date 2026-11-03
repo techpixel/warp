@@ -2,7 +2,7 @@
 // Usage: node warp.js input.svg [output.svg]   (omit output to print to stdout)
 import { readFileSync, writeFileSync } from "node:fs";
 import { DOMParser } from "linkedom";
-import { warpSvgElement } from "./src/warp-core.js";
+import { warpSvgElement } from "./src/lib/warp-core.js";
 
 /**
  * Customize me.
