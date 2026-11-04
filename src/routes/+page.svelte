@@ -184,10 +184,7 @@
     else if (e.key === "-") editor.zoomBy(1 / 1.25);
     else if (e.key === "0") editor.view = editor.fitView;
     else if ((e.key === "Delete" || e.key === "Backspace") && !editor.editing) return;
-    else if ((e.key === "Delete" || e.key === "Backspace") && editor.selectedGuide !== null) {
-      e.preventDefault();
-      editor.unlink(editor.selectedGuide);
-    } else if ((e.key === "Delete" || e.key === "Backspace") && editor.selected.length) {
+    else if ((e.key === "Delete" || e.key === "Backspace") && editor.selected.length) {
       e.preventDefault();
       editor.removePoints(editor.selected);
     }

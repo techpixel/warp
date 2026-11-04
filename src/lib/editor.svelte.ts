@@ -300,7 +300,6 @@ export class Editor {
     hybridGreen: this.hybridGreen,
     } = doc);
     this.selected = [];
-    this.selectedGuide = null;
     this.notice = "";
   }
 
@@ -484,7 +483,6 @@ export class Editor {
     this.notice = "";
     this.preset = null;
     this.selected = [];
-    this.selectedGuide = null;
   }
 
   /**
@@ -638,7 +636,6 @@ export class Editor {
 
   /** Clicking a point selects it; with `add`, toggles it in the selection. */
   select(i: number, add: boolean) {
-    this.selectedGuide = null;
     if (!add) this.selected = [i];
     else this.selected = this.selected.includes(i) ? this.selected.filter((j) => j !== i) : [...this.selected, i];
   }
@@ -693,22 +690,11 @@ export class Editor {
     this.#markFreeform();
   }
 
-  /** The connector clicked on (an index into `guides`), which Delete removes. */
-  selectedGuide = $state<number | null>(null);
-
-  /** Selects connector i on its own, clearing the point selection. */
-  selectGuide(i: number) {
-    if (this.#editOnly()) return;
-    this.selected = [];
-    this.selectedGuide = i;
-  }
-
   /** Removes connector i; its points move on their own again. */
   unlink(i: number) {
     if (this.#editOnly()) return;
     this.loose = [...this.loose, this.guides[i]];
     this.guides = this.guides.toSpliced(i, 1);
-    this.selectedGuide = null;
     this.#markFreeform();
   }
 

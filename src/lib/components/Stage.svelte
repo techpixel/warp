@@ -92,16 +92,51 @@
     }
     return d + "Z";
   });
+  /** The point on connector i nearest `p` (a click near the line lands on it), short of its ends on the cage. */
+  function onConnector(i: number, p: Pt): Pt {
+    const [a, b] = editor.guides[i], A = solid[a], B = solid[b];
+    const dx = B[0] - A[0], dy = B[1] - A[1];
+    const t = Math.max(0.02, Math.min(0.98, ((p[0] - A[0]) * dx + (p[1] - A[1]) * dy) / (dx * dx + dy * dy || 1)));
+    return [A[0] + t * dx, A[1] + t * dy];
+  }
+
+  /**
+   * Pressing a connector selects its two points; dragging it moves them together.
+   * Window listeners rather than pointer capture, so a double-click still reaches it.
+   */
+  function grabConnector(e: PointerEvent, i: number) {
+    if (e.button !== 0 || spaceHeld) return;
+    e.stopPropagation();
+    const [a, b] = editor.guides[i];
+    editor.select(a, false);
+    editor.select(b, true);
+    const from = toSvg(e), A = solid[a];
+    let dragging = false;
+    const move = (ev: PointerEvent) => {
+      // Starts once the pointer has moved a few screen pixels, so a click doesn't nudge it.
+      if (!dragging && Math.hypot(ev.clientX - e.clientX, ev.clientY - e.clientY) < 3) return;
+      dragging = true;
+      const p = toSvg(ev);
+      editor.dragPoint(a, [A[0] + p[0] - from[0], A[1] + p[1] - from[1]]);
+    };
+    window.addEventListener("pointermove", move);
+    hold(e.currentTarget as Element, e, () => window.removeEventListener("pointermove", move), false);
+  }
+
   // What the mouse does in the cage editor, shown while there's no notice. A mesh
   // cage keeps its grid, so it can't take new edge points or connectors.
-  type Gesture = "drag" | "double" | "right";
+  type Gesture = "drag" | "click" | "double" | "right";
   const hints = $derived.by((): [Gesture, string][] => {
-    const mesh = !!editor.inner?.dims;
+    const mesh = !!editor.inner?.dims, linked = editor.guides.length > 0;
+    // Double-clicking a point starts a connector; double-clicking a connector adds a center point.
+    const double = !mesh && linked ? "Connect a point, or add a center point on a connector"
+      : !mesh ? "Connect a point, then click where to"
+      : linked ? "Add a center point on a connector"
+      : "";
     return [
-      ["drag", "Move a point"],
-      ...(mesh ? [] : [["double", "Add a point on an edge"]] as [Gesture, string][]),
-      ["double", "Add a center point inside the cage"],
-      ...(mesh ? [] : [["double", "Connect a point, then click where to"]] as [Gesture, string][]),
+      ["drag", linked ? "Move a point or connector" : "Move a point"],
+      ...(mesh ? [] : [["click", "Add a point on an edge"]] as [Gesture, string][]),
+      ...(double ? [["double", double]] as [Gesture, string][] : []),
       ["right", "Remove a point or connector"],
     ];
   });
@@ -237,10 +272,14 @@
       linking = null;
       align = [];
     };
-    // The click that lands it doesn't reach the canvas, so it can't also select or drag.
+    // The click that lands it doesn't reach the canvas, so it can't also select or
+    // drag, or (as a click on an edge) add a point of its own.
+    const swallow = (ev: Event) => ev.stopPropagation();
     const click = (ev: PointerEvent) => {
       ev.stopPropagation();
       ev.preventDefault();
+      window.addEventListener("click", swallow, { capture: true, once: true });
+      setTimeout(() => window.removeEventListener("click", swallow, true), 500);
       const target = ev.button === 0 ? linkTarget(i, toSvg(ev)).target : null;
       end();
       if (target) editor.linkTo(target);
@@ -414,7 +453,6 @@
     hold(svg, e, () => {
       svg.removeEventListener("pointermove", move);
       if (!marquee && !add) editor.selected = [];
-      editor.selectedGuide = null;
       marquee = null;
     });
   }
@@ -443,7 +481,7 @@
 <svelte:window onkeydown={onkey} onkeyup={onkey} onblur={() => (spaceHeld = false)} />
 
 <main
-  class={{ dragover }}
+  class={{ dragover, editing: editor.editing && !bare }}
   bind:clientWidth={width}
   bind:clientHeight={height}
   ondragover={(e) => {
@@ -468,34 +506,26 @@
     role="application"
     aria-label="Warp canvas"
     onpointerdown={pan}
-    ondblclick={(e) => {
-      if (editor.perspective) editor.setOrbit({ pitch: 0, yaw: 0, roll: 0 });
-      else if (editor.editing && !(e.target as Element).closest(".edge-hit, .handle, .knob, .axis-target")) {
-        editor.addCenter(toSvg(e));
-      }
-    }}
+    ondblclick={() => editor.perspective && editor.setOrbit({ pitch: 0, yaw: 0, roll: 0 })}
   >
     <g class="ghost" {@attach original}></g>
     {#if editor.image}
       <image class="ghost" href={editor.image.url} x="0" y="0" width={editor.image.width} height={editor.image.height} />
     {/if}
-    <g {@attach warped}></g>
+    <g class="warped" {@attach warped}></g>
     <path class="grid" d={gridPath} />
     {#if editor.kind && !bare}
       <path class="cage-other" d={cagePath(other, otherCtrl)} />
       <path class="cage" d={cagePath(solid, solidCtrl)} />
       {#each editor.guideLines as line, i (i)}
-        <polyline class={["mesh-line", { selected: editor.editing && editor.selectedGuide === i }]} points={line} />
+        <polyline class="mesh-line" points={line} />
         {#if editor.editing}
         <polyline
           class="guide-hit"
           points={line}
           role="presentation"
-          onpointerdown={(e) => {
-            if (e.button !== 0 || spaceHeld) return;
-            e.stopPropagation();
-            editor.selectGuide(i);
-          }}
+          onpointerdown={(e) => grabConnector(e, i)}
+          ondblclick={(e) => editor.addCenter(onConnector(i, toSvg(e)))}
           oncontextmenu={(e) => {
             e.preventDefault();
             editor.unlink(i);
@@ -519,7 +549,7 @@
             {points}
             role="presentation"
             onpointerdown={(e) => e.stopPropagation()}
-            ondblclick={(e) => editor.insertVertex(i, nearestT(solid, solidCtrl, i, toSvg(e)))}
+            onclick={(e) => editor.insertVertex(i, nearestT(solid, solidCtrl, i, toSvg(e)))}
           />
         {/each}
       </g>
@@ -592,15 +622,18 @@
   </svg>
 
   {#snippet mouse(gesture: Gesture)}
-    <!-- A mouse with the pressed button filled: twice for a double-click, with an arrow for a drag. -->
+    <!-- A drag is the four-way move arrow; a click, a mouse with the pressed button
+         filled (with a 2 for a double-click). -->
     <svg class="gesture" width="20" height="16" viewBox="0 0 20 16" aria-hidden="true">
-      <rect x="1.5" y="1.5" width="9" height="13" rx="4.5" />
-      <path d="M6 1.5v5M1.5 6.5h9" />
-      <path class="pressed" d={gesture === "right" ? "M6 1.5a4.5 4.5 0 0 1 4.5 4.5v.5H6z" : "M6 1.5a4.5 4.5 0 0 0-4.5 4.5v.5H6z"} />
-      {#if gesture === "double"}
-        <text x="13" y="11">2</text>
-      {:else if gesture === "drag"}
-        <path d="M13 8h6m-2-2 2 2-2 2" />
+      {#if gesture === "drag"}
+        <path d="M8 1.5v13M1.5 8h13M6 3.5l2-2 2 2M6 12.5l2 2 2-2M3.5 6l-2 2 2 2M12.5 6l2 2-2 2" />
+      {:else}
+        <rect x="1.5" y="1.5" width="9" height="13" rx="4.5" />
+        <path d="M6 1.5v5M1.5 6.5h9" />
+        <path class="pressed" d={gesture === "right" ? "M6 1.5a4.5 4.5 0 0 1 4.5 4.5v.5H6z" : "M6 1.5a4.5 4.5 0 0 0-4.5 4.5v.5H6z"} />
+        {#if gesture === "double"}
+          <text x="13" y="11">2</text>
+        {/if}
       {/if}
     </svg>
   {/snippet}
@@ -665,9 +698,24 @@
     vector-effect: non-scaling-stroke;
     pointer-events: none;
   }
-  .ghost {
+  /* The original shows faintly behind the warp; while the cage is edited, it's the
+     other way round. (An image's warp is on the canvas, below; then it goes on top.) */
+  .ghost,
+  .warped,
+  canvas {
+    transition: opacity var(--ease);
+  }
+  .ghost,
+  .editing .warped,
+  .editing canvas {
     opacity: 0.15;
     pointer-events: none;
+  }
+  .editing .ghost {
+    opacity: 1;
+  }
+  .editing canvas {
+    z-index: 1;
   }
   .cage,
   .cage-other {
@@ -779,11 +827,6 @@
   .mesh-line.dotted {
     stroke-dasharray: 2 3;
   }
-  .mesh-line.selected {
-    stroke: #ff3b30;
-    stroke-width: 2;
-    opacity: 1;
-  }
   .guide-hit:hover {
     stroke: rgb(255 255 255 / 0.12);
   }
@@ -824,10 +867,11 @@
     color: var(--muted);
     pointer-events: none;
   }
+  /* One to a line. */
   .hints {
     display: flex;
-    flex-wrap: wrap;
-    gap: 4px 16px;
+    flex-direction: column;
+    gap: 4px;
     padding: 0;
     list-style: none;
   }
