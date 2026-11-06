@@ -36,7 +36,7 @@ export type Method = { id: string; label: string; color: string; onColor: string
 const noop: Log = () => {};
 
 // Known methods get a display name and come first, in this order.
-const LABELS: Record<string, string> = { mvc: "MVC", perspective_mvc: "Perspective", green: "Green", hybrid: "Hybrid" };
+const LABELS: Record<string, string> = { mvc: "Standard (MVC)", perspective_mvc: "Perspective", green: "Proportional (Green)", hybrid: "Hybrid" };
 // Accent, and the text color that reads on it (white only where it has the contrast).
 const COLORS: Record<string, [string, string]> = {
   mvc: ["#5549ff", "#fff"],
