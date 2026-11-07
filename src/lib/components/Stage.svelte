@@ -6,8 +6,9 @@
   import { cagePath, edgePoint, insidePoly, nearestT, type Pt } from "#lib/cage.js";
   import { meshLines } from "#lib/mesh.js";
   import { drawMesh } from "#lib/raster.js";
+  import { prepareWarp } from "#lib/warp-core.js";
   import { hold } from "#lib/hold.js";
-  import type { Editor, LinkTarget } from "#lib/editor.svelte.js";
+  import { SUBDIVISIONS, type Editor, type LinkTarget } from "#lib/editor.svelte.js";
 
   // `bare`: just the artwork, with no cage (no warp pass is selected).
   let { editor, bare = false, onfile }: { editor: Editor; bare?: boolean; onfile: (file: File) => void } = $props();
@@ -50,11 +51,16 @@
     const nx = count(x1 - x0, dims?.cols), ny = count(y1 - y0, dims?.rows);
     const at = ([x, y]: Pt) => `${+x.toFixed(2)} ${+y.toFixed(2)}`;
     const inside = (p: Pt) => insidePoly(p, rest);
-    // Points on the cage itself are nudged a hair toward its middle, since some methods are undefined there.
-    const n = rest.length / 2;
-    let cx = 0, cy = 0;
-    for (let k = 0; k < n; k++) (cx += rest[2 * k] / n), (cy += rest[2 * k + 1] / n);
-    const onEdge = (p: Pt): Pt => warp([p[0] + (cx - p[0]) * 1e-4, p[1] + (cy - p[1]) * 1e-4]);
+    // Points on the cage itself: some methods are undefined there, and lose
+    // precision just inside it, so two points a little way in (along the line,
+    // toward its sample `inward` inside the cage) are warped and the line
+    // through them carried back out to the edge.
+    const onEdge = (p: Pt, inward: Pt): Pt => {
+      const dx = inward[0] - p[0], dy = inward[1] - p[1], len = Math.hypot(dx, dy);
+      const h = Math.min(cell / 32, len / 4) / (len || 1);
+      const a = warp([p[0] + dx * h, p[1] + dy * h]), b = warp([p[0] + dx * 2 * h, p[1] + dy * 2 * h]);
+      return [2 * a[0] - b[0], 2 * a[1] - b[1]];
+    };
     /**
      * The warped parts of the line through `pts` that lie inside the cage, each
      * running right up to its edge (found by halving the gap between samples).
@@ -70,7 +76,7 @@
             if (inside(m) === was) a = m;
             else b = m;
           }
-          d += was ? `L${at(onEdge(a))}` : `M${at(onEdge(b))}`;
+          d += was ? `L${at(onEdge(a, prev))}` : `M${at(onEdge(b, p))}`;
         }
         if (is) d += `${prev ? "L" : "M"}${at(warp(p))}`; // entering already moved to the edge
         prev = p;
@@ -83,23 +89,23 @@
     let d = "";
     for (const x of steps(x0, x1, nx)) d += line(ys.map((y): Pt => [x, y]));
     for (const y of steps(y0, y1, ny)) d += line(xs.map((x): Pt => [x, y]));
-    // The grid's edge: the original cage's outline through the warp, a point every quarter cell.
+    // The grid's edge: the original cage's outline through the warp, a point
+    // every quarter cell, each stepped in along its edge's inward normal.
+    const n = rest.length / 2;
+    let area = 0;
+    for (let k = 0; k < n; k++) area += rest[2 * k] * rest[(2 * k + 3) % rest.length] - rest[(2 * k + 2) % rest.length] * rest[2 * k + 1];
+    const turn = area > 0 ? 1 : -1;
     for (let k = 0; k < n; k++) {
       const a: Pt = [rest[2 * k], rest[2 * k + 1]], b: Pt = [rest[(2 * k + 2) % rest.length], rest[(2 * k + 3) % rest.length]];
-      const parts = Math.max(1, Math.ceil(Math.hypot(b[0] - a[0], b[1] - a[1]) / (cell / 4)));
-      d += k ? "" : `M${at(onEdge(a))}`;
-      for (let j = 1; j <= parts; j++) d += `L${at(onEdge([a[0] + ((b[0] - a[0]) * j) / parts, a[1] + ((b[1] - a[1]) * j) / parts]))}`;
+      const len = Math.hypot(b[0] - a[0], b[1] - a[1]) || 1;
+      const ix = (-(b[1] - a[1]) / len) * turn * cell, iy = ((b[0] - a[0]) / len) * turn * cell;
+      const edge = (p: Pt) => onEdge(p, [p[0] + ix, p[1] + iy]);
+      const parts = Math.max(1, Math.ceil(len / (cell / 4)));
+      d += k ? "" : `M${at(edge(a))}`;
+      for (let j = 1; j <= parts; j++) d += `L${at(edge([a[0] + ((b[0] - a[0]) * j) / parts, a[1] + ((b[1] - a[1]) * j) / parts]))}`;
     }
     return d + "Z";
   });
-  /** The point on connector i nearest `p` (a click near the line lands on it), short of its ends on the cage. */
-  function onConnector(i: number, p: Pt): Pt {
-    const [a, b] = editor.guides[i], A = solid[a], B = solid[b];
-    const dx = B[0] - A[0], dy = B[1] - A[1];
-    const t = Math.max(0.02, Math.min(0.98, ((p[0] - A[0]) * dx + (p[1] - A[1]) * dy) / (dx * dx + dy * dy || 1)));
-    return [A[0] + t * dx, A[1] + t * dy];
-  }
-
   /**
    * Pressing a connector selects its two points; dragging it moves them together.
    * Window listeners rather than pointer capture, so a double-click still reaches it.
@@ -183,12 +189,26 @@
     else g.replaceChildren();
   };
 
-  /** The warped artwork, re-warped at most once per frame while dragging. */
+  /**
+   * The warped artwork, re-warped at most once per frame while dragging. Its
+   * paths are copied in and parsed once per artwork; each frame only moves
+   * their points, so large files stay quick.
+   */
+  let built: { g: SVGGElement; source: SVGSVGElement; warp: (fn: (p: Pt) => Pt) => void } | null = null;
   const warped = (g: SVGGElement) => {
     const source = editor.source;
     void editor.deformation;
-    if (!source) return void g.replaceChildren();
-    const frame = requestAnimationFrame(() => fillGroup(g, editor.warpedClone()));
+    if (!source) {
+      built = null;
+      return void g.replaceChildren();
+    }
+    const frame = requestAnimationFrame(() => {
+      if (built?.g !== g || built.source !== source) {
+        fillGroup(g, source);
+        built = { g, source, warp: prepareWarp(g, SUBDIVISIONS) };
+      }
+      built.warp(editor.chained("svg"));
+    });
     return () => cancelAnimationFrame(frame);
   };
 
@@ -251,15 +271,15 @@
     });
   }
 
-  // Linking: after a double-click on a cage point (in the cage editor), a
-  // connector follows the pointer until the next click, which lands it on a
-  // point (linking it) or an edge (adding a linked point there). Anywhere else,
-  // or Escape, cancels.
+  // Linking: after a double-click on a point (in the cage editor), a connector
+  // follows the pointer until the next click, which lands it on a point
+  // (linking it), or an edge or a connector (adding a linked point there).
+  // Anywhere else, or Escape, cancels.
   let linking = $state<{ from: Pt; at: Pt; target: LinkTarget | null } | null>(null);
   let lastPress: { i: number; at: number; x: number; y: number } | null = null;
 
   function startLink(i: number) {
-    const from = solid[i];
+    const from = points[i];
     linking = { from, at: from, target: null };
     const move = (ev: PointerEvent) => {
       const { at, target } = linkTarget(i, toSvg(ev));
@@ -296,18 +316,32 @@
 
   /**
    * What a connector from point i lands on with the pointer at `c`: the nearest
-   * other cage point, else the nearest spot on an edge (slid along it into
-   * line with another point when that's close), else nothing.
+   * other point, else the nearest spot on a connector, else the nearest spot on
+   * an edge (slid along it into line with another point when that's close),
+   * else nothing.
    */
   function linkTarget(i: number, c: Pt): { at: Pt; target: LinkTarget | null } {
-    const hit = LINK_HIT_PX / scale, others = points.filter((_, j) => j !== i);
+    const hit = LINK_HIT_PX / scale;
     align = [];
     let vertex = -1, best = hit;
-    solid.forEach((p, j) => {
+    points.forEach((p, j) => {
       const d = Math.hypot(p[0] - c[0], p[1] - c[1]);
       if (j !== i && d < best) (best = d), (vertex = j);
     });
-    if (vertex >= 0) return { at: solid[vertex], target: { vertex } };
+    if (vertex >= 0) return { at: points[vertex], target: { vertex } };
+    let connector = -1, along = 0;
+    best = hit;
+    editor.guides.forEach(([a, b], g) => {
+      if (a === i || b === i) return;
+      const A = points[a], B = points[b], dx = B[0] - A[0], dy = B[1] - A[1];
+      const t = Math.max(0.02, Math.min(0.98, ((c[0] - A[0]) * dx + (c[1] - A[1]) * dy) / (dx * dx + dy * dy || 1)));
+      const d = Math.hypot(A[0] + t * dx - c[0], A[1] + t * dy - c[1]);
+      if (d < best) (best = d), (connector = g), (along = t);
+    });
+    if (connector >= 0) {
+      const [a, b] = editor.guides[connector], A = points[a], B = points[b];
+      return { at: [A[0] + along * (B[0] - A[0]), A[1] + along * (B[1] - A[1])], target: { connector, t: along } };
+    }
     let edge = -1, t = 0;
     best = hit;
     solid.forEach((_, e) => {
@@ -366,7 +400,7 @@
     // starts a connector. (Caught here: pointer capture keeps dblclick from firing reliably.)
     const now = performance.now(), last = lastPress;
     lastPress = { i, at: now, x: e.clientX, y: e.clientY };
-    if (editor.editing && i < solid.length && last?.i === i && now - last.at < 400 && Math.hypot(e.clientX - last.x, e.clientY - last.y) < 6) {
+    if (editor.editing && last?.i === i && now - last.at < 400 && Math.hypot(e.clientX - last.x, e.clientY - last.y) < 6) {
       lastPress = null;
       editor.select(i, false);
       if (editor.linkFrom === i) startLink(i);
@@ -525,7 +559,7 @@
           points={line}
           role="presentation"
           onpointerdown={(e) => grabConnector(e, i)}
-          ondblclick={(e) => editor.addCenter(onConnector(i, toSvg(e)))}
+          ondblclick={(e) => editor.addCenter(i, toSvg(e))}
           oncontextmenu={(e) => {
             e.preventDefault();
             editor.unlink(i);
@@ -533,9 +567,6 @@
         >
         </polyline>
         {/if}
-      {/each}
-      {#each editor.looseLines as line, i (i)}
-        <polyline class="mesh-line dotted" points={line} />
       {/each}
       {#if editor.shownGrid}
         {#each meshLines(editor.shownGrid) as line, i (i)}
@@ -593,7 +624,7 @@
           tabindex="-1"
           aria-label="Add a center point where the connectors cross"
           onpointerdown={(e) => e.stopPropagation()}
-          onclick={() => editor.addCenter(crossing.rest)}
+          onclick={() => editor.addCrossing(crossing.on)}
           onkeydown={() => {}}
         >
           <circle cx={crossing.at[0]} cy={crossing.at[1]} {r} />
@@ -623,16 +654,19 @@
 
   {#snippet mouse(gesture: Gesture)}
     <!-- A drag is the four-way move arrow; a click, a mouse with the pressed button
-         filled (with a 2 for a double-click). -->
-    <svg class="gesture" width="20" height="16" viewBox="0 0 20 16" aria-hidden="true">
+         filled (with a 2 for a double-click). Both centre on x = 8, and every icon is
+         as wide as the one with the 2, so the labels line up. -->
+    <svg class="gesture" width="22" height="16" viewBox="0 0 22 16" aria-hidden="true">
       {#if gesture === "drag"}
         <path d="M8 1.5v13M1.5 8h13M6 3.5l2-2 2 2M6 12.5l2 2 2-2M3.5 6l-2 2 2 2M12.5 6l2 2-2 2" />
       {:else}
-        <rect x="1.5" y="1.5" width="9" height="13" rx="4.5" />
-        <path d="M6 1.5v5M1.5 6.5h9" />
-        <path class="pressed" d={gesture === "right" ? "M6 1.5a4.5 4.5 0 0 1 4.5 4.5v.5H6z" : "M6 1.5a4.5 4.5 0 0 0-4.5 4.5v.5H6z"} />
+        <g transform="translate(2 0)">
+          <rect x="1.5" y="1.5" width="9" height="13" rx="4.5" />
+          <path d="M6 1.5v5M1.5 6.5h9" />
+          <path class="pressed" d={gesture === "right" ? "M6 1.5a4.5 4.5 0 0 1 4.5 4.5v.5H6z" : "M6 1.5a4.5 4.5 0 0 0-4.5 4.5v.5H6z"} />
+        </g>
         {#if gesture === "double"}
-          <text x="13" y="11">2</text>
+          <text x="15" y="11.5">2</text>
         {/if}
       {/if}
     </svg>
@@ -878,7 +912,7 @@
   .hints li {
     display: flex;
     align-items: center;
-    gap: 4px;
+    gap: 6px;
   }
   .gesture {
     flex: none;

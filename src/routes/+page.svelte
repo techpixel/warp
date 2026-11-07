@@ -35,7 +35,8 @@
   /**
    * The settings panel sits at the bottom of the sidebar, so when its height
    * changes, its top edge moves: it slides there (with the same timing) instead
-   * of jumping. A change mid-slide carries on from where the panel is.
+   * of jumping. A change mid-slide carries on from where the panel is. The
+   * buttons above it ride along, as they do on its intro.
    */
   const slideOnResize = (el: HTMLElement) => {
     const born = performance.now();
@@ -47,12 +48,15 @@
       if (!grew || !EASE_MS || performance.now() - born < EASE_MS) return;
       const now = getComputedStyle(el).transform;
       const from = (now === "none" ? 0 : new DOMMatrix(now).m42) + grew;
-      for (const a of el.getAnimations()) if (a.id === "settle") a.cancel();
-      el.animate([{ transform: `translateY(${from}px)` }, { transform: "none" }], {
-        id: "settle",
-        duration: EASE_MS,
-        easing: "cubic-bezier(0.33, 1, 0.68, 1)", // cubicOut
-      });
+      for (const target of [el, actions]) {
+        if (!target) continue;
+        for (const a of target.getAnimations()) if (a.id === "settle") a.cancel();
+        target.animate([{ transform: `translateY(${from}px)` }, { transform: "none" }], {
+          id: "settle",
+          duration: EASE_MS,
+          easing: "cubic-bezier(0.33, 1, 0.68, 1)", // cubicOut
+        });
+      }
     });
     observer.observe(el);
     return () => observer.disconnect();
@@ -60,6 +64,7 @@
   const editor = $derived(passes.current);
   let fileInput = $state<HTMLInputElement>();
   let cageInput = $state<HTMLInputElement>();
+  let actions = $state<HTMLDivElement>();
 
   // Which submenu is open, and where (its top-left, over the button that opened it).
   let menu = $state<{ kind: "method" | "more" | "advanced"; at: { x: number; y: number; w: number; h: number } } | null>(null);
@@ -241,7 +246,7 @@
         {/each}
       </div>
 
-      <div class="actions">
+      <div class="actions" bind:this={actions}>
         {#if inFigma}
           <Button attention={selectionReady} onclick={requestSelection}>Import selection</Button>
           <Button primary disabled={!passes.base.kind} onclick={() => passes.export()}>Place</Button>
@@ -410,20 +415,22 @@
               <Slider
                 id="smoothing"
                 label="Smoothing Complexity"
-                min={1}
+                min={0}
                 max={32}
                 value={editor.smoothing}
                 oninput={(v) => (editor.smoothing = v)}
                 reset={16}
                 disabled={!editor.curves}
               />
-              <Checkbox
-                label="Smooth"
-                bind:checked={editor.curves}
-                onchange={() => {
-                  try { localStorage.setItem("warp:curves", editor.curves ? "on" : "off"); } catch {}
-                }}
-              />
+              <div class="checks">
+                <Checkbox
+                  label="Smooth"
+                  bind:checked={editor.curves}
+                  onchange={() => {
+                    try { localStorage.setItem("warp:curves", editor.curves ? "on" : "off"); } catch {}
+                  }}
+                />
+              </div>
             </div>
           </div>
         </div>
@@ -605,7 +612,7 @@
     cursor: pointer;
     transition: background-color var(--ease), color var(--ease);
   }
-  .tiles button:hover:not(:disabled) {
+  .tiles button:hover:not(:disabled, [aria-pressed="true"]) {
     background: var(--hover);
   }
   .tiles button[aria-pressed="true"] {
@@ -690,6 +697,10 @@
     display: flex;
     flex-direction: column;
     gap: 6px;
+  }
+  .checks {
+    display: flex;
+    gap: 16px;
   }
   .rotation {
     display: grid;

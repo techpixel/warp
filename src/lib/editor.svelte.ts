@@ -2,12 +2,12 @@ import { pathToCurve } from "svg-path-commander/util";
 import { SHAPES, collectCurves, contentBBox, mapPoints, shapeToPath, subdivide, warpSvgElement } from "./warp-core.js";
 import { alphaBounds, drawMesh, gridBounds, warpGrid, type Texture } from "./raster";
 import {
-  type Box, type Ctrl, type Pt,
+  type Box, type Ctrl, type Pt, type SplitWarp,
   bounds, cagePath, copyCage, copyCtrl, edgePoint, fitCage, fitEdge, flattenCage, isCurved, joinAt, quadCage,
-  insidePoly, splitEdge, straightCtrl, straightEdge, CURVE_SAMPLES,
+  insidePoly, lerp, splitEdge, straightCtrl, straightEdge, CURVE_SAMPLES,
 } from "./cage";
-import { MESH, type Dims, gridNodes, innerRC, meshInner } from "./mesh";
-import { panelWarp } from "./panels";
+import { MESH, type Dims, gridNodes, innerRC, meshInner, meshRest, meshWarp } from "./mesh";
+import { panelWarp, type Links } from "./panels";
 import { pullField } from "./pull";
 import { saveFile } from "./save";
 import { PRESETS, layoutCage, type Layout, type Preset } from "./presets";
@@ -30,7 +30,8 @@ type Apply = (w: Float64Array, out: Float64Array) => void;
 type DeformOptions = { blend?: number };
 type Deformer = (rest: Float64Array, moved: Float64Array, log: Log, options?: DeformOptions) => Apply;
 // `panels` marks MVC: with connectors it warps each panel they split the cage
-// into on its own (src/lib/panels.ts); its weights and deformer cover the rest.
+// into on its own, or the whole cage as one (src/lib/panels.ts); its weights
+// and deformer cover the rest.
 // `color` is the method's accent (its pass, settings and menu option); `onColor` reads on it.
 export type Method = { id: string; label: string; color: string; onColor: string; weights: Weights; deformer: Deformer; panels?: boolean };
 const noop: Log = () => {};
@@ -69,7 +70,8 @@ const MAX_TILT = 80; // degrees either way; past this the plane is edge-on and t
 export type View = { x: number; y: number; w: number; h: number };
 export type Orbit = { pitch: number; yaw: number; roll: number };
 /** Where a connector dragged out of a point lands: an existing cage `vertex`, or a new point on edge `edge` at `t`. */
-export type LinkTarget = { edge: number; t: number; vertex?: undefined } | { vertex: number };
+/** Where a new connector lands: on a point, on a cage edge (adding a point there), or on a connector (adding a center point there). */
+export type LinkTarget = { vertex: number } | { edge: number; t: number } | { connector: number; t: number };
 
 // A cage comes from an SVG (a shape with id="cage", else the first shape; plus
 // id="cage-deformed" if present) or JSON ({ rest, restCtrl?, moved?, movedCtrl? } or [[x, y], …]).
@@ -77,7 +79,9 @@ type CageSpec = { rest: Pt[]; restCtrl: Ctrl[]; moved?: Pt[]; movedCtrl?: Ctrl[]
 
 // Weights per render pass ("svg" paths, "raster" grid), indexed by call order.
 // Each entry remembers its point, so a changed point is recomputed on its own.
-type Pass = { method: Method; rest: Float64Array; pts: number[]; w: (Float64Array | null)[] };
+// Through a mesh surface or panels (`split`), each point's spot is cached instead.
+type Pass = { method: Method; rest: Float64Array; split?: unknown[]; pts: number[]; w: (Float64Array | null)[]; spots: unknown[] };
+const sameParts = (a: unknown[] | undefined, b: unknown[]) => a?.length === b.length && a.every((v, k) => v === b[k]);
 
 // The rest cage sits this far outside the artwork (fraction of its longest
 // side), so no warped point lies on the cage, where some methods are undefined.
@@ -110,10 +114,10 @@ export class Editor {
   cage = $state.raw<Pt[]>([]); // where the user has dragged it
   ctrl = $state.raw<Ctrl[]>([]);
   // Points inside the cage: where they sit on the original, and how far they've
-  // been dragged from where the outer cage alone would carry them. A mesh
-  // cage's grid points come first (`dims` is its grid size); center points
-  // added in the cage editor follow.
-  inner = $state.raw<{ dims?: Dims; rest: Pt[]; offset: Pt[] } | null>(null);
+  // been dragged from where the outer cage alone would carry them. Either a
+  // mesh cage's grid points (`dims` is its grid size), or center points, each
+  // tied to the connector it sits on (`ties`, one per point).
+  inner = $state.raw<{ dims?: Dims; rest: Pt[]; offset: Pt[]; ties?: Tie[] } | null>(null);
   // Per cage edge: whether its curve was set (by the user or a preset). Edges
   // that weren't stay straight, their control points following their ends.
   bent = $state.raw<boolean[]>([]);
@@ -137,7 +141,9 @@ export class Editor {
   #options = $derived<DeformOptions>({ blend: 1 - this.hybridGreen / 100 });
   // Points each curved cage edge is broken into for the warp methods: more
   // follows the curve more closely, fewer is coarser (and quicker).
+  // 0 (or 1) is a single straight piece per edge: as if Smooth were off.
   smoothing = $state(CURVE_SAMPLES);
+  #samples = $derived(Math.max(1, this.smoothing));
   // Bezier cage edges. Off, every edge acts straight; the curves are kept for when it's back on.
   curves = $state(true);
   cageChoice = $state<string | null>(null); // the cage tile shown as picked: a cage type or preset id ("fit" is Freeform)
@@ -178,59 +184,96 @@ export class Editor {
   curved = $derived(this.restCage.map((_, i) =>
     this.curves && (isCurved(this.restCage, this.restCtrl, i) || isCurved(this.cage, this.ctrl, i))));
   restFlat = $derived.by(() => {
-    const next = flattenCage(this.restCage, this.restCtrl, this.curved, this.smoothing);
+    const next = flattenCage(this.restCage, this.restCtrl, this.curved, this.#samples);
     const last = this.#lastRest;
     if (next.length === last.length && next.every((v, k) => v === last[k])) return last;
     return (this.#lastRest = Float64Array.from(next));
   });
-  movedFlat = $derived(Float64Array.from(flattenCage(this.effCage, this.effCtrl, this.curved, this.smoothing)));
+  movedFlat = $derived(Float64Array.from(flattenCage(this.effCage, this.effCtrl, this.curved, this.#samples)));
 
-  /** Where the outer cage alone carries each inner point. */
-  innerBase = $derived(this.inner ? this.inner.rest.map((p) => this.#warpOne(p, this.movedFlat)) : []);
-  /** The inner points as drawn: on the original while editing, else where the warp puts them. */
-  innerShown = $derived.by((): Pt[] => {
+  /** Each inner point's pull, scaled by its strength. */
+  #innerPulls = $derived.by((): Pt[] => {
+    const n = this.restCage.length;
+    return this.inner?.offset.map(([x, y], k): Pt => [x * this.#s(n + k), y * this.#s(n + k)]) ?? [];
+  });
+
+  /** With MVC and connectors, the connectors are folds and the center points their corners. */
+  #folding = $derived(!!(this.method?.panels && this.guides.length));
+
+  /** Point `id` (cage point, then center point) on the rest cage. */
+  #restAt = (id: number): Pt => {
+    const n = this.restCage.length;
+    return id < n ? this.restCage[id] : this.inner!.rest[id - n];
+  };
+
+  /**
+   * While folding, where the connectors carry each center point, in order (a
+   * connector only ends at center points before the ones on it).
+   */
+  #carried = $derived.by((): Pt[] | null => {
+    const inner = this.inner, n = this.restCage.length;
+    if (!inner?.ties || !this.#folding) return null;
+    const base: Pt[] = [], moved: Pt[] = [];
+    // Each point once its connectors' ends are placed; a joint (tied to none) goes where the outer cage carries it.
+    const place = (k: number): Pt => {
+      if (moved[k]) return moved[k];
+      moved[k] = inner.rest[k]; // in case of a loop
+      const tie = inner.ties![k];
+      const b = tie.on.length ? tieMoved(tie, at, this.#restAt, inner.rest[k]) : this.#warpOne(inner.rest[k], this.movedFlat, false);
+      base[k] = b;
+      return (moved[k] = scaleFrom(b, [b[0] + inner.offset[k][0], b[1] + inner.offset[k][1]], this.#s(n + k)));
+    };
+    const at = (id: number) => (id < n ? this.effCage[id] : place(id - n));
+    inner.ties.forEach((_, k) => place(k));
+    return base;
+  });
+
+  /**
+   * Where the outer cage alone carries each inner point. A mesh's is by the
+   * method alone, as its surface (panelMap) is built from these. While
+   * folding, a center point's is where its connectors carry it.
+   */
+  innerBase = $derived(this.#carried ?? (this.inner ? this.inner.rest.map((p) => this.#warpOne(p, this.movedFlat, !this.inner?.dims)) : []));
+  /** Where the warp puts the inner points. */
+  innerMoved = $derived.by((): Pt[] => {
     const inner = this.inner;
     if (!inner) return [];
-    if (this.editing) return inner.rest;
     const n = this.restCage.length;
     return this.innerBase.map((b, k) => scaleFrom(b, [b[0] + inner.offset[k][0], b[1] + inner.offset[k][1]], this.#s(n + k)));
   });
+  /** The inner points as drawn: on the original while editing, else where the warp puts them. */
+  innerShown = $derived(this.editing ? (this.inner?.rest ?? []) : this.innerMoved);
   /** A mesh cage's whole grid as drawn, for its inner lines. */
   shownGrid = $derived(this.inner?.dims ? gridNodes(this.active, this.innerShown, this.inner.dims) : null);
 
-  /**
-   * Removed connectors' end points. A removed connector still shows as a
-   * dotted line while center points sit along it, but links nothing.
-   */
-  loose = $state.raw<[number, number][]>([]);
+  /** Each connector's points in order: its ends, with the center points along it between. */
+  #chains = $derived(this.guides.map((g): number[] => {
+    const n = this.restCage.length, inner = this.inner;
+    if (!inner?.ties) return g;
+    const A = this.#restAt(g[0]), B = this.#restAt(g[1]);
+    const along = inner.ties.flatMap((tie, k) => (tie.on.some((h) => samePair(g, h)) ? [{ k, t: alongSegment(A, B, inner.rest[k]) }] : []));
+    return [g[0], ...along.sort((p, q) => p.t - q.t).map(({ k }) => n + k), g[1]];
+  }));
 
-  /** The dotted lines of removed connectors, through the center points along each, as drawn. */
-  looseLines = $derived.by(() => {
-    const c = this.restCage, rest = this.inner?.rest ?? [];
-    if (!rest.length) return [];
-    const size = Math.max(bounds(c).width, bounds(c).height);
-    return this.loose.flatMap(([a, b]) => {
-      const A = c[a], B = c[b], d: Pt = [B[0] - A[0], B[1] - A[1]], len2 = d[0] ** 2 + d[1] ** 2 || 1;
-      const along = rest.flatMap((p, k) => {
-        const t = ((p[0] - A[0]) * d[0] + (p[1] - A[1]) * d[1]) / len2;
-        const off = Math.abs((p[0] - A[0]) * d[1] - (p[1] - A[1]) * d[0]) / Math.sqrt(len2);
-        return t > 0 && t < 1 && off < size * 0.01 ? [{ t, k }] : [];
-      });
-      if (!along.length) return [];
-      along.sort((p, q) => p.t - q.t);
-      return [[this.active[a], ...along.map(({ k }) => this.innerShown[k]), this.active[b]].join(" ")];
-    });
+  /** The connectors, as drawn: through the center points along them. */
+  guideLines = $derived(this.#chains.map((chain) => chain.map((id) => this.shownPoint(id)).join(" ")));
+
+  /** The connectors as panel edges: straight pieces between their points. */
+  #links = $derived.by((): Links => {
+    const inner = this.inner?.ties ? this.inner : null;
+    return {
+      rest: inner?.rest ?? [],
+      moved: inner ? this.innerMoved : [],
+      segments: this.#chains.flatMap((c) => c.slice(1).map((id, k): [number, number] => [c[k], id])),
+    };
   });
-
-  /** The connectors between linked points, as drawn. */
-  guideLines = $derived(this.guides.map(([a, b]) => `${this.active[a]} ${this.active[b]}`));
 
   /** The inner points' pulls on top of the outer cage's warp, as a field over the original. Null when nothing pulls. */
   pulls = $derived.by(() => {
-    const n = this.restCage.length, inner = this.inner;
-    if (!inner) return null;
-    const pulls = inner.offset.map(([x, y], k): Pt => [x * this.#s(n + k), y * this.#s(n + k)]);
-    return pullField(inner.rest, pulls, this.restFlat);
+    const inner = this.inner;
+    // While folding, the center points are panel corners, carrying their own pulls.
+    if (!inner || this.meshSurface || (inner.ties && this.#folding)) return null;
+    return pullField(inner.rest, this.#innerPulls, this.restFlat);
   });
 
   // ---------------------------------------------------------------- undo
@@ -240,7 +283,7 @@ export class Editor {
   /** The cage as it stands, for undo. */
   doc = $derived({
     restCage: this.restCage, restCtrl: this.restCtrl, cage: this.cage, ctrl: this.ctrl, inner: this.inner,
-    bent: this.bent, guides: this.guides, loose: this.loose, strengths: this.strengths, cageType: this.cageType,
+    bent: this.bent, guides: this.guides, strengths: this.strengths, cageType: this.cageType,
     orbit: this.orbit, perspectiveStrength: this.perspectiveStrength, cageChoice: this.cageChoice, preset: this.preset,
     hybridGreen: this.hybridGreen,
   });
@@ -295,7 +338,7 @@ export class Editor {
     this.#current = doc;
     ({
       restCage: this.restCage, restCtrl: this.restCtrl, cage: this.cage, ctrl: this.ctrl, inner: this.inner,
-      bent: this.bent, guides: this.guides, loose: this.loose, strengths: this.strengths, cageType: this.cageType,
+      bent: this.bent, guides: this.guides, strengths: this.strengths, cageType: this.cageType,
       orbit: this.orbit, perspectiveStrength: this.perspectiveStrength, cageChoice: this.cageChoice, preset: this.preset,
     hybridGreen: this.hybridGreen,
     } = doc);
@@ -303,13 +346,33 @@ export class Editor {
     this.notice = "";
   }
 
-  /** With MVC and connectors, the warp through the panels (null outside them). Without connectors it's plain MVC. */
-  panelMap = $derived(this.method?.panels && this.guides.length
-    ? panelWarp({
-      rest: this.restCage, restCtrl: this.restCtrlShown, moved: this.effCage, movedCtrl: this.effCtrlShown,
-      curved: this.curved, guides: this.guides, samples: this.smoothing,
-    })
-    : null);
+  /** With MVC, a mesh cage warps as one smooth surface through its grid, inner points and all. */
+  meshSurface = $derived(!!(this.method?.panels && this.inner?.dims));
+
+  /** A mesh surface's rest side, rebuilt only when the rest cage changes. */
+  #meshRest = $derived.by(() => {
+    const inner = this.inner;
+    if (!this.meshSurface || !inner?.dims) return null;
+    return meshRest(inner.dims, { ring: this.restCage, ctrl: this.restCtrlShown, inner: inner.rest });
+  });
+
+  /**
+   * With MVC, the warp through a mesh's surface, or through the panels
+   * connectors split the cage into (null outside them). Otherwise it's plain MVC.
+   */
+  panelMap = $derived.by((): SplitWarp<any> | null => {
+    if (this.#meshRest) return meshWarp(this.#meshRest, { ring: this.effCage, ctrl: this.effCtrlShown, inner: this.innerMoved });
+    return this.method?.panels && this.guides.length
+      ? panelWarp({
+        rest: this.restCage, restCtrl: this.restCtrlShown, moved: this.effCage, movedCtrl: this.effCtrlShown,
+        curved: this.curved, samples: this.#samples,
+        links: this.#links,
+      })
+      : null;
+  });
+
+  /** What panelMap's `locate` depends on (all of it the rest cage's), so its cached spots last while these do. */
+  #splitRest = $derived([this.restFlat, this.restCtrlShown, this.guides, this.inner?.rest, this.meshSurface]);
 
   /** Everything the warp depends on, for redrawing when any of it changes. */
   deformation = $derived([this.method, this.restFlat, this.movedFlat, this.pulls, this.panelMap, this.upstream, this.#options]);
@@ -347,15 +410,31 @@ export class Editor {
 
   #beginCagePass(name: string): (p: Pt) => Pt {
     const m = this.method, rest = this.restFlat, moved = this.movedFlat;
-    // Undeformed is the identity, so it's skipped.
-    if (!m || moved.every((v, k) => v === rest[k])) return (p) => p;
+    // Undeformed is the identity, so it's skipped. While folding, pulled center
+    // points deform it too, and so do a mesh surface's pulled inner points.
+    const pulled = (this.meshSurface || (this.#folding && !!this.inner?.ties)) && this.#innerPulls.some(([x, y]) => x || y);
+    if (!m || (!pulled && moved.every((v, k) => v === rest[k]))) return (p) => p;
     const panels = this.panelMap;
     if (panels) {
-      // Only points outside every panel (outside the cage) fall back to MVC, uncached.
-      return (p) => panels(p) ?? this.#warpOne(p, moved, false);
+      const split = this.#splitRest, old = this.#passes[name];
+      const pass = old?.method === m && old.rest === rest && sameParts(old.split, split)
+        ? old
+        : (this.#passes[name] = { method: m, rest, split, pts: [], w: [], spots: [] });
+      let i = 0;
+      return (p) => {
+        const k = i++;
+        if (pass.pts[2 * k] !== p[0] || pass.pts[2 * k + 1] !== p[1] || pass.spots[k] === undefined) {
+          pass.pts[2 * k] = p[0];
+          pass.pts[2 * k + 1] = p[1];
+          try { pass.spots[k] = panels.locate(p); } catch { pass.spots[k] = null; }
+        }
+        const spot = pass.spots[k];
+        // Only points outside every panel (outside the cage) fall back to MVC, uncached.
+        return spot ? panels.place(spot) : this.#warpOne(p, moved, false);
+      };
     }
     const old = this.#passes[name];
-    const pass = old?.method === m && old.rest === rest ? old : (this.#passes[name] = { method: m, rest, pts: [], w: [] });
+    const pass = old?.method === m && old.rest === rest ? old : (this.#passes[name] = { method: m, rest, pts: [], w: [], spots: [] });
     let apply: Apply | null = null;
     try { apply = m.deformer(rest, moved, noop, this.#options); } catch {}
     const out = new Float64Array(2);
@@ -379,10 +458,10 @@ export class Editor {
   #warpOne(p: Pt, moved: Float64Array, panels = true): Pt {
     const m = this.method;
     if (!m) return p;
-    if (panels && moved === this.movedFlat && this.panelMap) {
-      const q = this.panelMap(p);
-      if (q) return q;
-    }
+    // Read panelMap only when asked to: a mesh's surface is built from points warped without it.
+    const split = panels && moved === this.movedFlat ? this.panelMap : null;
+    const spot = split?.locate(p);
+    if (spot) return split!.place(spot);
     try {
       const w = m.weights(p[0], p[1], this.restFlat, noop);
       const out = new Float64Array(2);
@@ -444,9 +523,14 @@ export class Editor {
       this.contentPts = [];
       for (let k = 0; k < pts.length; k += 2) this.contentPts.push(...deform([pts[k], pts[k + 1]]));
     } else this.contentPts = pts;
-    const xs = this.contentPts.filter((_, k) => k % 2 === 0), ys = this.contentPts.filter((_, k) => k % 2 === 1);
-    const x = Math.min(...xs), y = Math.min(...ys);
-    this.contentBox = xs.length ? { x, y, width: Math.max(...xs) - x, height: Math.max(...ys) - y } : null;
+    // A loop, not Math.min(...pts): large artwork has more points than a call can take arguments.
+    const c = this.contentPts;
+    let x = Infinity, y = Infinity, x2 = -Infinity, y2 = -Infinity;
+    for (let k = 0; k < c.length; k += 2) {
+      x = Math.min(x, c[k]), x2 = Math.max(x2, c[k]);
+      y = Math.min(y, c[k + 1]), y2 = Math.max(y2, c[k + 1]);
+    }
+    this.contentBox = c.length ? { x, y, width: x2 - x, height: y2 - y } : null;
     this.#passes = {};
   }
 
@@ -526,7 +610,6 @@ export class Editor {
     this.ctrl = copyCtrl(this.restCtrl);
     this.inner = null;
     this.guides = [];
-    this.loose = [];
     this.bent = this.restCage.map(() => false);
     if (type === "mesh") this.#buildLayout({ ...MESH, guides: "none", mesh: true });
     this.#resetStrengths();
@@ -559,16 +642,20 @@ export class Editor {
   /** Replaces the cage with a layout's, undeformed, over the artwork. */
   #buildLayout(layout: Layout) {
     const box = this.contentBox!;
-    const { ring, guides } = layoutCage(layout);
+    const { ring, guides, nodes } = layoutCage(layout);
     const m = margin(box), x = box.x - m, y = box.y - m, w = box.width + 2 * m, h = box.height + 2 * m;
-    this.restCage = ring.map(([u, v]) => [x + u * w, y + v * h]);
+    this.restCage = ring.map(([u, v]): Pt => [x + u * w, y + v * h]);
     this.restCtrl = straightCtrl(this.restCage);
     this.cage = copyCage(this.restCage);
     this.ctrl = copyCtrl(this.restCtrl);
     const dims = { cols: layout.cols, rows: layout.rows };
-    this.inner = layout.mesh ? { dims, rest: meshInner(box, m, dims), offset: innerRC(dims).map((): Pt => [0, 0]) } : null;
+    const at = ([u, v]: [number, number]): Pt => [x + u * w, y + v * h];
+    this.inner = layout.mesh
+      ? { dims, rest: meshInner(box, m, dims), offset: innerRC(dims).map((): Pt => [0, 0]) }
+      : nodes.length
+        ? { rest: nodes.map(at), offset: nodes.map((): Pt => [0, 0]), ties: nodes.map(() => ({ on: [], t: 0 })) }
+        : null;
     this.guides = guides;
-    this.loose = [];
     this.bent = this.restCage.map(() => false);
     this.#resetStrengths();
     this.#cageChanged();
@@ -608,8 +695,14 @@ export class Editor {
     // Inner points go where the preset puts them, as offsets from where the
     // outer cage (at full strength) now carries them.
     const inner = this.inner;
-    if (inner) {
-      const full = Float64Array.from(flattenCage(this.cage, this.ctrl, this.curved, this.smoothing));
+    if (inner?.ties && this.#folding) {
+      // One at a time, in order: where the connectors carry a center point depends on the earlier ones' pulls.
+      inner.rest.forEach((q, k) => {
+        const b = this.innerBase[k], t = target(q), cur = this.inner!;
+        this.inner = { ...cur, offset: cur.offset.with(k, [t[0] - b[0], t[1] - b[1]]) };
+      });
+    } else if (inner) {
+      const full = Float64Array.from(flattenCage(this.cage, this.ctrl, this.curved, this.#samples));
       const base = inner.rest.map((q) => this.#warpOne(q, full));
       this.inner = { ...inner, offset: inner.rest.map((q, k) => {
         const t = target(q);
@@ -679,72 +772,190 @@ export class Editor {
 
   isLinked = (a: number, b: number) => this.guides.some(([p, q]) => (p === a && q === b) || (p === b && q === a));
 
-  /** Links two cage points (not a Mesh cage's inner ones) with a connector. */
+  /**
+   * Links two points with a connector: cage points or center points (not a
+   * Mesh cage's grid points), but not a center point to a connector it's on.
+   */
   link(a: number, b: number) {
     if (this.#editOnly()) return;
-    const n = this.restCage.length;
-    if (a === b || a >= n || b >= n || this.isLinked(a, b)) return;
+    const n = this.restCage.length, count = n + (this.inner?.ties?.length ?? 0);
+    if (a === b || a >= count || b >= count || this.isLinked(a, b)) return;
+    const on = (k: number, end: number) => !!this.inner?.ties?.[k - n]?.on.some(([p, q]) => p === end || q === end);
+    if ((a >= n && on(a, b)) || (b >= n && on(b, a))) return void (this.notice = "That point is already on a connector to there.");
     this.guides = [...this.guides, [a, b]];
-    this.loose = this.loose.filter(([p, q]) => !((p === a && q === b) || (p === b && q === a)));
     this.#addCrossings();
     this.#markFreeform();
   }
 
-  /** Removes connector i; its points move on their own again. */
+  /**
+   * Removes connector i; its points move on their own again. Its center points
+   * go with it, but one where it crossed another connector stays on that one.
+   */
   unlink(i: number) {
     if (this.#editOnly()) return;
-    this.loose = [...this.loose, this.guides[i]];
     this.guides = this.guides.toSpliced(i, 1);
+    this.#retie();
     this.#markFreeform();
   }
 
   /** Puts a center point wherever connectors cross and none is yet. */
   #addCrossings() {
-    const found = this.crossings.map((c) => c.rest);
-    if (!found.length || this.inner?.dims) return;
-    const inner = this.inner ?? { rest: [], offset: [] };
-    this.inner = { ...inner, rest: [...inner.rest, ...found], offset: [...inner.offset, ...found.map((): Pt => [0, 0])] };
-    this.strengths = [...this.strengths, ...found.map(() => 100)];
+    for (const c of this.crossings) this.#addTied({ on: c.on, t: 0 });
   }
 
-  /** The point a connector can start from: the one selected cage point, while editing. */
+  /** Adds a center point tied to its connector(s), at rest where they put it; false if it can't. */
+  #addTied(tie: Tie) {
+    const inner = this.inner ?? { rest: [], offset: [], ties: [] }, n = this.restCage.length;
+    if (inner.dims) return false;
+    const at = tieRest(tie, (id) => (id < n ? this.restCage[id] : inner.rest[id - n] ?? null));
+    if (!at) return false;
+    this.inner = { ...inner, rest: [...inner.rest, at], offset: [...inner.offset, [0, 0]], ties: [...(inner.ties ?? []), tie] };
+    this.strengths = [...this.strengths, 100];
+    return true;
+  }
+
+  /**
+   * Brings the center points and connectors back in line after either
+   * changes. `update` can re-tie point k first (null removes it). A point loses
+   * its ties to connectors that are gone (one where two crossed stays on the
+   * other) and goes when it has none left, or its connectors no longer cross;
+   * connectors to a point that goes, go too, and so on. What's left is placed
+   * on the rest cage and renumbered.
+   */
+  #retie(update: (tie: Tie, k: number) => Tie | null = (tie) => tie) {
+    const inner = this.inner;
+    if (!inner?.ties) return;
+    const n = this.restCage.length;
+    let ties = inner.ties.map((tie, k) => update(tie, k));
+    let guides = this.guides;
+    const rest: (Pt | null)[] = [];
+    for (let changed = true; changed;) {
+      changed = false;
+      const gone = (id: number) => id < 0 || (id >= n && !ties[id - n]);
+      const kept = guides.filter(([a, b]) => !gone(a) && !gone(b));
+      if (kept.length !== guides.length) (guides = kept), (changed = true);
+      ties = ties.map((tie, k) => {
+        if (!tie) return null;
+        // A joint stays while a connector ends at it.
+        if (!tie.on.length) return guides.some((g) => g.includes(n + k)) ? tie : ((changed = true), null);
+        const on = tie.on.filter((g) => guides.some((h) => samePair(g, h)));
+        if (on.length === tie.on.length) return tie;
+        changed = true;
+        if (!on.length) return null;
+        const [a, b] = on[0];
+        return { on, t: alongSegment(this.#restAt(a), this.#restAt(b), inner.rest[k]) };
+      });
+      // Each point once its connectors' ends are placed; a joint stays where it is.
+      const placed: boolean[] = [];
+      const place = (k: number): Pt | null => {
+        if (placed[k]) return rest[k];
+        placed[k] = true;
+        rest[k] = null; // in case of a loop
+        const tie = ties[k];
+        return (rest[k] = !tie ? null : tie.on.length ? tieRest(tie, at) : inner.rest[k]);
+      };
+      const at = (id: number) => (id < n ? this.restCage[id] : place(id - n));
+      ties.forEach((tie, k) => {
+        if (tie && !place(k)) (ties[k] = null), (changed = true);
+      });
+    }
+    // Nothing changed: `inner` stays as it is, so what's derived from it stands.
+    const same = (k: number) => ties[k] === inner.ties![k] && rest[k]![0] === inner.rest[k][0] && rest[k]![1] === inner.rest[k][1];
+    if (guides === this.guides && ties.every((_, k) => same(k))) return;
+    const keep = ties.flatMap((tie, k) => (tie ? [k] : []));
+    const id = (i: number) => (i < n ? i : n + keep.indexOf(i - n));
+    const pair = ([a, b]: [number, number]): [number, number] => [id(a), id(b)];
+    if (keep.length < ties.length || guides !== this.guides) this.guides = guides.map(pair);
+    this.inner = keep.length
+      ? {
+        ...inner,
+        rest: keep.map((k) => rest[k]!),
+        offset: keep.map((k) => inner.offset[k]),
+        ties: keep.map((k) => ({ ...ties[k]!, on: ties[k]!.on.map(pair) })),
+      }
+      : null;
+    if (keep.length === ties.length) return;
+    this.strengths = [...this.strengths.slice(0, n), ...keep.map((k) => this.strengths[n + k])];
+    this.selected = this.selected.flatMap((j) => (j < n ? [j] : keep.includes(j - n) ? [id(j)] : []));
+  }
+
+  /**
+   * Makes center point k a joint: each connector it's on is split there into
+   * two, and the other points on that connector move onto whichever half they're on.
+   */
+  #makeJoint(k: number) {
+    const inner = this.inner!, ties = inner.ties!, node = this.restCage.length + k;
+    let guides = this.guides, next = ties;
+    for (const g of ties[k].on) {
+      const [a, b] = g, A = this.#restAt(a), B = this.#restAt(b);
+      const cut = alongSegment(A, B, inner.rest[k]);
+      const first: [number, number] = [a, node], second: [number, number] = [node, b];
+      guides = guides.flatMap((h) => (samePair(h, g) ? [first, second] : [h]));
+      next = next.map((tie, j) => {
+        if (j === k || !tie.on.some((h) => samePair(h, g))) return tie;
+        const s = alongSegment(A, B, inner.rest[j]), half = s < cut ? first : second;
+        const t = s < cut ? s / cut : (s - cut) / (1 - cut);
+        return { on: tie.on.map((h) => (samePair(h, g) ? half : h)), t: tie.on.length > 1 ? tie.t : t };
+      });
+    }
+    this.guides = guides;
+    this.inner = { ...inner, ties: next.with(k, { on: [], t: 0 }) };
+  }
+
+  /** The point a connector can start from: the one selected point (not a Mesh cage's), while editing. */
   linkFrom = $derived(
-    this.editing && this.selected.length === 1 && this.selected[0] < this.restCage.length && !this.inner?.dims && !this.perspective
+    this.editing && this.selected.length === 1 && !this.inner?.dims && !this.perspective
       ? this.selected[0]
       : undefined,
   );
 
   /**
-   * Where two connectors cross on the original cage: each is a spot to add a
-   * center point. `at` is where it's drawn (carried through the warp unless editing).
+   * Where two connectors cross on the original cage, with no center point yet:
+   * each is a spot to add one. `at` is where it's drawn (carried through the
+   * warp unless editing).
    */
-  crossings = $derived.by((): { rest: Pt; at: Pt }[] => {
+  crossings = $derived.by((): { rest: Pt; at: Pt; on: [number, number][] }[] => {
     const c = this.restCage, g = this.guides;
     if (this.perspective || g.length < 2) return [];
     const size = Math.max(bounds(c).width, bounds(c).height);
     const taken = this.inner?.rest ?? [];
-    const found: Pt[] = [];
+    const found: { rest: Pt; on: [number, number][] }[] = [];
+    const at = this.#restAt;
     for (let i = 0; i < g.length; i++) {
       for (let j = i + 1; j < g.length; j++) {
         const [a, b] = g[i], [p, q] = g[j];
         if (a === p || a === q || b === p || b === q) continue; // connectors sharing a point meet there
-        const x = segmentCrossing(c[a], c[b], c[p], c[q]);
+        const x = segmentCrossing(at(a), at(b), at(p), at(q));
         const near = (o: Pt) => x && Math.hypot(o[0] - x[0], o[1] - x[1]) < size * 0.01;
-        if (x && !taken.some(near) && !found.some(near)) found.push(x);
+        if (x && !taken.some(near) && !found.some((f) => near(f.rest))) found.push({ rest: x, on: [g[i], g[j]] });
       }
     }
-    if (this.editing) return found.map((rest) => ({ rest, at: rest }));
+    if (this.editing) return found.map((f) => ({ ...f, at: f.rest }));
     void this.deformation;
     const deform = this.beginPass("crossings");
-    return found.map((rest) => ({ rest, at: deform(rest) }));
+    return found.map((f) => ({ ...f, at: deform(f.rest) }));
   });
 
-  /** Links the selected point to an existing point, or to a new point added on an edge; keeps it selected. */
+  /**
+   * Links the selected point to an existing point, or to a new point added on
+   * an edge or a connector; keeps it selected.
+   */
   linkTo(target: LinkTarget) {
     if (this.#editOnly()) return;
     const sel = this.linkFrom;
-    if (sel === undefined || target.vertex === sel) return;
-    if (target.vertex !== undefined) return this.link(sel, target.vertex);
+    if (sel === undefined) return;
+    if ("vertex" in target) return target.vertex === sel ? undefined : this.link(sel, target.vertex);
+    if ("connector" in target) {
+      if (this.#chains[target.connector]?.includes(sel)) return;
+      const count = () => this.restCage.length + (this.inner?.rest.length ?? 0);
+      const before = count(), [a, b] = this.guides[target.connector].map(this.#restAt);
+      this.addCenter(target.connector, lerp(a, b, target.t));
+      if (count() === before) return;
+      this.link(sel, before);
+      this.selected = [sel];
+      return;
+    }
+    if (this.#meshFixed()) return;
     this.insertVertex(target.edge, target.t);
     const kept = sel > target.edge ? sel + 1 : sel;
     this.link(kept, target.edge + 1);
@@ -782,6 +993,7 @@ export class Editor {
     if (this.editing) {
       this.restCage = this.restCage.with(i, shift(this.restCage[i]));
       this.restCtrl = moveCtrl(this.restCtrl);
+      this.#retie();
     }
     this.cage = this.cage.with(i, shift(this.cage[i]));
     this.ctrl = moveCtrl(this.ctrl);
@@ -794,15 +1006,21 @@ export class Editor {
     for (const e of edges) {
       if (this.bent[e]) continue;
       const f = (e + 1) % n;
-      this.restCtrl = this.restCtrl.with(e, straightEdge(this.restCage[e], this.restCage[f]));
+      // The rest cage only moves while editing; replacing its controls otherwise would drop the cached warp.
+      if (this.editing) this.restCtrl = this.restCtrl.with(e, straightEdge(this.restCage[e], this.restCage[f]));
       this.ctrl = this.ctrl.with(e, straightEdge(this.cage[e], this.cage[f]));
     }
   }
 
   /** Moves inner point k: on the original while editing (keeping its pull), else sets its pull. */
   #moveInner(k: number, to: Pt) {
-    const inner = this.inner!;
-    if (this.editing) this.inner = { ...inner, rest: inner.rest.with(k, to) };
+    const inner = this.inner!, tie = inner.ties?.[k];
+    if (this.editing && tie) {
+      // Dragged, a center point becomes a joint its connectors bend through; the ones on connectors to it follow.
+      if (tie.on.length) this.#makeJoint(k);
+      this.inner = { ...this.inner!, rest: this.inner!.rest.with(k, to) };
+      this.#retie();
+    } else if (this.editing) this.inner = { ...inner, rest: inner.rest.with(k, to) };
     else {
       const [bx, by] = this.innerBase[k], s = this.#s(this.restCage.length + k);
       this.inner = { ...inner, offset: inner.offset.with(k, [(to[0] - bx) / s, (to[1] - by) / s]) };
@@ -871,18 +1089,24 @@ export class Editor {
     return !!this.inner?.dims || this.perspective;
   }
 
-  /** Adds a center point at `at` on the original (the cage's middle by default), and selects it. */
-  addCenter(at?: Pt) {
+  /** Adds a center point on connector i, nearest `at` on the original, and selects it. */
+  addCenter(i: number, at: Pt) {
     if (this.#editOnly()) return;
-    if (this.perspective || !this.restCage.length) return;
-    if (at && !insidePoly(at, this.restFlat)) return void (this.notice = "Center points go inside the cage.");
-    const c = this.restCage, n = c.length;
-    const p: Pt = at ?? [c.reduce((s, q) => s + q[0], 0) / n, c.reduce((s, q) => s + q[1], 0) / n];
-    const inner = this.inner ?? { rest: [], offset: [] };
-    this.inner = { ...inner, rest: [...inner.rest, p], offset: [...inner.offset, [0, 0]] };
-    this.strengths = [...this.strengths, 100];
+    const g = this.guides[i];
+    const t = Math.max(TIE_MARGIN, Math.min(1 - TIE_MARGIN, alongSegment(this.#restAt(g[0]), this.#restAt(g[1]), at)));
+    this.#addSelected({ on: [g], t });
+  }
+
+  /** Adds a center point where two connectors cross (one of `crossings`), and selects it. */
+  addCrossing(on: [number, number][]) {
+    if (this.#editOnly()) return;
+    this.#addSelected({ on, t: 0 });
+  }
+
+  #addSelected(tie: Tie) {
+    if (!this.#addTied(tie)) return;
     this.notice = "";
-    this.selected = [n + inner.rest.length];
+    this.selected = [this.restCage.length + this.inner!.rest.length - 1];
     this.#markFreeform();
   }
 
@@ -893,9 +1117,12 @@ export class Editor {
       this.notice = "That's one of the mesh's grid points; only added center points can be removed.";
       return;
     }
-    const rest = inner.rest.toSpliced(k, 1);
-    this.inner = rest.length || dims ? { ...inner, rest, offset: inner.offset.toSpliced(k, 1) } : null;
-    this.strengths = this.strengths.toSpliced(this.restCage.length + k, 1);
+    if (inner.ties) this.#retie((tie, j) => (j === k ? null : tie));
+    else {
+      const rest = inner.rest.toSpliced(k, 1);
+      this.inner = rest.length || dims ? { ...inner, rest, offset: inner.offset.toSpliced(k, 1) } : null;
+      this.strengths = this.strengths.toSpliced(this.restCage.length + k, 1);
+    }
     this.selected = [];
     this.#markFreeform();
   }
@@ -911,7 +1138,7 @@ export class Editor {
     this.strengths = this.strengths.toSpliced(i + 1, 0, 100);
     const shift = ([a, b]: [number, number]): [number, number] => [a > i ? a + 1 : a, b > i ? b + 1 : b];
     this.guides = this.guides.map(shift);
-    this.loose = this.loose.map(shift);
+    this.#retie((tie) => ({ ...tie, on: tie.on.map(shift) }));
     this.#cageChanged();
     this.#markFreeform();
   }
@@ -933,7 +1160,9 @@ export class Editor {
       .filter(([a, b]) => a !== i && b !== i)
       .map(([a, b]): [number, number] => [a > i ? a - 1 : a, b > i ? b - 1 : b]);
     this.guides = drop(this.guides);
-    this.loose = drop(this.loose);
+    // Center points on a connector that went with the point go too.
+    const id = (j: number) => (j === i ? -1 : j > i ? j - 1 : j);
+    this.#retie((tie) => ({ ...tie, on: tie.on.map(([a, b]) => [id(a), id(b)]) }));
     this.#cageChanged();
     this.#markFreeform();
   }
@@ -946,7 +1175,6 @@ export class Editor {
     this.bent = this.restCage.map((_, i) => isCurved(this.restCage, this.restCtrl, i) || isCurved(this.cage, this.ctrl, i));
     this.inner = null;
     this.guides = [];
-    this.loose = [];
     this.#resetStrengths();
     this.cageChoice = null;
     this.#cageChanged();
@@ -1162,6 +1390,49 @@ function orbitCorners(rect: Pt[], orbit: Orbit, strength: number): Pt[] {
     const k = 1 / Math.max(MIN_DEPTH, 1 + z2 * depth);
     return [cx + x2 * k, cy + y1 * k];
   });
+}
+
+/**
+ * A center point's place: `t` of the way along its connector (a pair of
+ * points: cage points, or center points numbered after them), or, tied to
+ * two, where they cross. Tied to none, it's a joint: connectors end at it, and
+ * it stays where it's put.
+ */
+type Tie = { on: [number, number][]; t: number };
+
+/** How close to its ends a center point can be added on a connector. */
+const TIE_MARGIN = 0.02;
+
+/** Where a tied center point sits, with its connectors' ends `at`, or null if they don't cross. */
+function tieRest({ on, t }: Tie, at: (id: number) => Pt | null): Pt | null {
+  const ends = on.flat().map(at);
+  if (ends.some((p) => !p)) return null;
+  const [a, b, p, q] = ends as Pt[];
+  return on.length > 1 ? segmentCrossing(a, b, p, q) : lerp(a, b, t);
+}
+
+/**
+ * Where a tied center point (at `self` on the rest cage) is carried, with its
+ * connectors' ends moved to `at`: as far along its connector, or where its
+ * two cross; once they've been dragged apart, midway between where each carries it.
+ */
+function tieMoved(tie: Tie, at: (id: number) => Pt, restAt: (id: number) => Pt, self: Pt): Pt {
+  const [[a, b], second] = tie.on;
+  if (!second) return lerp(at(a), at(b), tie.t);
+  const [p, q] = second;
+  const hit = segmentCrossing(at(a), at(b), at(p), at(q));
+  if (hit) return hit;
+  const u = lerp(at(a), at(b), alongSegment(restAt(a), restAt(b), self));
+  const v = lerp(at(p), at(q), alongSegment(restAt(p), restAt(q), self));
+  return [(u[0] + v[0]) / 2, (u[1] + v[1]) / 2];
+}
+
+const samePair = ([a, b]: [number, number], [p, q]: [number, number]) => (a === p && b === q) || (a === q && b === p);
+
+/** How far along a–b the nearest point to `p` is, as a fraction. */
+function alongSegment(a: Pt, b: Pt, p: Pt) {
+  const dx = b[0] - a[0], dy = b[1] - a[1];
+  return ((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / (dx * dx + dy * dy || 1);
 }
 
 /** Where segments a–b and p–q cross, strictly inside both, or null. */

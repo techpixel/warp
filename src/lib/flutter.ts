@@ -1,9 +1,9 @@
 // A pass tugged where it can't go gives a little. Pulled sideways (where a pass
 // never goes), it stretches out from its middle; pulled past the top or bottom of
-// the list, it bends into the Flag preset's warp (its cage, deformed as the preset
+// the list, it squashes flatter (spreading a little), and bends into the Flag preset's warp (its cage, deformed as the preset
 // deforms it, run through MVC over the element's box), the way it's pulled. Both
 // follow the pull, rubber-band style, and mix on a diagonal one; the bend is a
-// flag wave, rolling along all the while. Let go, the stretch springs back and
+// flag wave, rolling along all the while. Let go, the stretches spring back and
 // the wave dies away as it rolls.
 //
 // An element isn't paths, so it's drawn as thin vertical strips (live copies,
@@ -70,8 +70,8 @@ const tugs = new WeakMap<HTMLElement, Tug>();
 
 /**
  * Takes over drawing `el` while it's tugged: `pull(x, y)` with how far past
- * where it can go the pointer is (px; x either way stretches, y sets the wave
- * rolling, that way up), and `release()` when the tug ends, to let it settle.
+ * where it can go the pointer is (px; x either way stretches across, y either way
+ * flattens it and sets the wave rolling, that way up), and `release()` when the tug ends, to let it settle.
  * One per element: grabbed again mid-settle, it carries on from there.
  */
 export function tug(el: HTMLElement): Tug {
@@ -81,13 +81,13 @@ export function tug(el: HTMLElement): Tug {
 }
 
 function startTug(el: HTMLElement): Tug {
-  let stretch = 0, bend = 0, phase = 0;
-  let toStretch = 0, toBend = 0; // where the pull would put them, which they ease toward
+  let stretch = 0, squish = 0, bend = 0, phase = 0; // squish: flattening, from a pull up or down
+  let toStretch = 0, toSquish = 0, toBend = 0; // where the pull would put them, which they ease toward
   let layer: HTMLDivElement | null = null, strips: HTMLElement[] = [];
   // The wave at each strip's middle and edges, and a quarter-wave along: mixed by
   // the phase, they roll it along without running the warp again each frame.
   let sinAt: number[] = [], cosAt: number[] = [], sinEdge: number[] = [], cosEdge: number[] = [], step = 0;
-  let settle: { s0: number; b0: number; start: number } | null = null;
+  let settle: { s0: number; q0: number; b0: number; start: number } | null = null;
   let frame = 0, last = 0; // the running animation frame, and when the last one ran
 
   function build() {
@@ -134,7 +134,7 @@ function startTug(el: HTMLElement): Tug {
     const r = el.getBoundingClientRect(), w = el.offsetWidth, h = el.offsetHeight, k = r.width / w || 1;
     box.style.left = `${r.left + (r.width - w) / 2}px`;
     box.style.top = `${r.top + (r.height - h) / 2}px`;
-    box.style.transform = `scale(${k * (1 + stretch)}, ${k * (1 - stretch / 2)})`;
+    box.style.transform = `scale(${k * (1 + stretch + squish / 2)}, ${k * (1 - stretch / 2 - squish)})`;
     // sin(2πu − phase): the wave rolls along as the phase grows.
     const c = Math.cos(phase) * bend, s = Math.sin(phase) * bend;
     strips.forEach((strip, k) => {
@@ -152,17 +152,20 @@ function startTug(el: HTMLElement): Tug {
       // Eased toward the pull, so a quick move doesn't jump between wave and none.
       const k = 1 - Math.exp(-dt / FOLLOW_MS);
       stretch += (toStretch - stretch) * k;
+      squish += (toSquish - squish) * k;
       bend += (toBend - bend) * k;
     } else {
       const t = Math.min(1, (now - settle.start) / SETTLE_MS);
-      // The stretch springs back with an overshoot; the wave keeps rolling as it dies away.
-      stretch = settle.s0 * Math.exp(-6 * t) * Math.cos(3 * Math.PI * t);
+      // The stretches spring back with an overshoot; the wave keeps rolling as it dies away.
+      const spring = Math.exp(-6 * t) * Math.cos(3 * Math.PI * t);
+      stretch = settle.s0 * spring;
+      squish = settle.q0 * spring;
       bend = settle.b0 * Math.exp(-5 * t);
-      if (t >= 1) (stretch = bend = 0), (settle = null);
+      if (t >= 1) (stretch = squish = bend = 0), (settle = null);
     }
     // Done once it's back at rest with nothing pulling (easing only ever nears 0, so near is enough).
-    if (!settle && !toStretch && !toBend && Math.abs(stretch) < 1e-3 && Math.abs(bend) < 0.02) {
-      stretch = bend = 0;
+    if (!settle && !toStretch && !toSquish && !toBend && Math.abs(stretch) < 1e-3 && Math.abs(squish) < 1e-3 && Math.abs(bend) < 0.02) {
+      stretch = squish = bend = 0;
       frame = last = 0;
       return teardown();
     }
@@ -178,14 +181,15 @@ function startTug(el: HTMLElement): Tug {
     pull(x: number, y: number) {
       settle = null;
       toStretch = rubber(Math.abs(x), MAX_STRETCH);
+      toSquish = rubber(Math.abs(y), MAX_STRETCH);
       toBend = Math.sign(y) * MAX_BEND * Math.min(1, Math.abs(y) / BEND_REACH);
       run();
     },
     /** Lets it settle (unless it's settling already, or has nothing to settle). */
     release() {
-      toStretch = toBend = 0;
-      if (settle || (!stretch && !bend)) return;
-      settle = { s0: stretch, b0: bend, start: performance.now() };
+      toStretch = toSquish = toBend = 0;
+      if (settle || (!stretch && !squish && !bend)) return;
+      settle = { s0: stretch, q0: squish, b0: bend, start: performance.now() };
       run();
     },
   };

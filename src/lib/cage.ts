@@ -139,6 +139,36 @@ export function fitEdge(p0: Pt, p3: Pt, q1: Pt, q2: Pt): Ctrl {
   return [[x1, y1], [x2, y2]];
 }
 
+/**
+ * A warp in two steps. `locate` finds where a rest point sits (null outside
+ * the warp): it depends only on the rest cage, so it's cached per point while
+ * the cage is dragged. `place` carries that spot into the moved cage, every frame.
+ */
+export type SplitWarp<Spot = unknown> = { locate: (p: Pt) => Spot | null; place: (spot: Spot) => Pt };
+
+/**
+ * The (u, v) where `f` reaches `p`, by Newton's method from `start`, or null if
+ * it doesn't settle within `tol` (in `f`'s units).
+ */
+export function solveFor(f: (u: number, v: number) => Pt, p: Pt, start: Pt, tol: number): Pt | null {
+  let [u, v] = start;
+  const h = 1e-5;
+  for (let i = 0; i < 30; i++) {
+    const q = f(u, v), rx = p[0] - q[0], ry = p[1] - q[1];
+    if (Math.hypot(rx, ry) < tol) return [u, v];
+    const qu = f(u + h, v), qv = f(u, v + h);
+    const a = (qu[0] - q[0]) / h, c = (qu[1] - q[1]) / h, b = (qv[0] - q[0]) / h, d = (qv[1] - q[1]) / h;
+    const det = a * d - b * c;
+    if (!det) return null;
+    let du = (rx * d - b * ry) / det, dv = (a * ry - c * rx) / det;
+    // Short steps, so it can't leap past a fold of `f` to some other solution.
+    const step = Math.hypot(du, dv);
+    if (step > 0.25) (du *= 0.25 / step), (dv *= 0.25 / step);
+    (u += du), (v += dv);
+  }
+  return null;
+}
+
 /** Whether `p` is inside the flat [x0, y0, …] polygon (even-odd). */
 export function insidePoly([x, y]: Pt, poly: ArrayLike<number>) {
   let inside = false;

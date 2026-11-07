@@ -1,9 +1,17 @@
 // MVC by panels: connectors split the cage into panels, and each panel is
-// warped by MVC over its own outline, so every connector is a sharp fold.
-// Where connectors cross, the crossing is a corner shared by the panels
-// around it. With no connectors, the one panel is the cage: plain MVC.
+// warped on its own, so every connector is a sharp fold. Connectors run between
+// cage points and center points (the nodes), and each center point is a corner
+// shared by the panels around it, wherever it's been pulled. Where connectors
+// cross with no center point there, the crossing is a corner too. With no
+// connectors, the one panel is the cage.
+//
+// A panel with four corners (four sharp turns in its outline; any other points
+// lie along its sides) is warped as a Coons patch: it blends straight across
+// between opposite sides, so a bend along the top and bottom runs all the way
+// through, where MVC would flatten out towards the middle. Any other panel is
+// warped by MVC over its outline.
 
-import { edgePoint, insidePoly, lerp, type Ctrl, type Pt } from "./cage";
+import { edgePoint, insidePoly, lerp, solveFor, type Ctrl, type Pt, type SplitWarp } from "./cage";
 import { deformer as mvcDeformer, weights as mvcWeights } from "./warp/mvc";
 
 export type PanelCage = {
@@ -13,46 +21,68 @@ export type PanelCage = {
   movedCtrl: Ctrl[];
   /** Which edges are curved (in either cage); others are sampled as straight. */
   curved: boolean[];
-  guides: [number, number][];
   /** Points per curved edge, for panels warped by MVC. */
   samples: number;
+  links: Links;
 };
+
+/**
+ * The connectors, as straight segments between nodes: node i is cage point i,
+ * and node n + k (n cage points) is center point k, at `rest[k]` on the rest
+ * cage and `moved[k]` on the moved one.
+ */
+export type Links = { rest: Pt[]; moved: Pt[]; segments: [number, number][] };
+
+/** How sharply a panel's outline must turn at a point (radians) for it to be a corner. */
+const CORNER_TURN = Math.PI / 6;
 
 /** A side of a panel, from one corner to the next: along cage edge `edge` (forwards or not), or straight. */
 type Side = { edge: number; forward: boolean } | null;
 
+/**
+ * Where a rest point sits in its panel: its patch (u, v), or else its MVC
+ * weights over the panel's outline. `at` is the point itself.
+ */
+type Spot = { at: Pt; uv?: Pt; w?: Float64Array };
+export type PanelSpot = Spot & { panel: number };
+
 type Panel = {
   /** The outline on the rest cage, flat, for finding which panel a point is in. */
   outline: Float64Array;
-  map: (p: Pt) => Pt;
+  locate: (p: Pt) => Spot;
+  place: (spot: Spot) => Pt;
 };
 
-/** Maps points of the rest cage through the panels, or null for a point in none of them (outside the cage). */
-export function panelWarp(cage: PanelCage): (p: Pt) => Pt | null {
+/** Maps points of the rest cage through the panels; a point in none of them (outside the cage) isn't located. */
+export function panelWarp(cage: PanelCage): SplitWarp<PanelSpot> {
   const panels = buildPanels(cage);
-  return (p) => {
-    const panel = panels.find((q) => insidePoly(p, q.outline));
-    return panel ? panel.map(p) : null;
+  return {
+    locate: (p) => {
+      const panel = panels.findIndex((q) => insidePoly(p, q.outline));
+      return panel < 0 ? null : { ...panels[panel].locate(p), panel };
+    },
+    place: (spot) => panels[spot.panel].place(spot),
   };
 }
 
-function buildPanels({ rest, restCtrl, moved, movedCtrl, curved, guides, samples }: PanelCage): Panel[] {
+function buildPanels({ rest, restCtrl, moved, movedCtrl, curved, samples, links: graph }: PanelCage): Panel[] {
   const n = rest.length;
   if (n < 3) return [];
-  // Corners: the cage's points, then where connectors cross.
-  const R: Pt[] = [...rest], M: Pt[] = [...moved];
-  const adjacent = (a: number, b: number) => (a - b + n) % n === 1 || (b - a + n) % n === 1;
-  const cuts = guides.filter(([a, b]) => a !== b && a < n && b < n && !adjacent(a, b));
+  // Corners: the cage's points, the center points, then where connectors cross.
+  const R: Pt[] = [...rest, ...graph.rest], M: Pt[] = [...moved, ...graph.moved];
+  const nodes = R.length;
+  const adjacent = (a: number, b: number) => a < n && b < n && ((a - b + n) % n === 1 || (b - a + n) % n === 1);
+  const cuts = graph.segments.filter(([a, b]) => a !== b && a < nodes && b < nodes && !adjacent(a, b));
   const along: { t: number; node: number }[][] = cuts.map(() => []);
   for (let i = 0; i < cuts.length; i++) {
     for (let j = i + 1; j < cuts.length; j++) {
       const [a, b] = cuts[i], [c, d] = cuts[j];
       if (a === c || a === d || b === c || b === d) continue;
-      const hit = crossing(rest[a], rest[b], rest[c], rest[d]);
+      const hit = crossing(R[a], R[b], R[c], R[d]);
       if (!hit) continue;
       const node = R.length;
-      R.push(lerp(rest[a], rest[b], hit.t));
-      M.push(movedCrossing(moved[a], moved[b], moved[c], moved[d], hit.t, hit.u));
+      R.push(lerp(R[a], R[b], hit.t));
+      M.push(movedCrossing(M[a], M[b], M[c], M[d], hit.t, hit.u));
       along[i].push({ t: hit.t, node });
       along[j].push({ t: hit.u, node });
     }
@@ -96,7 +126,7 @@ function buildPanels({ rest, restCtrl, moved, movedCtrl, curved, guides, samples
       // the cage the other way (whichever way the cage's own points run).
       if (face.length < 3 || signedArea(face.map((i) => R[i])) <= 0) continue;
       const sides = face.map((u, k) => links.get(u)!.get(face[(k + 1) % face.length]) ?? null);
-      panels.push(mvcPanel(face, sides));
+      panels.push(coonsPanel(face, sides) ?? mvcPanel(face, sides));
     }
   }
   return panels;
@@ -115,11 +145,79 @@ function buildPanels({ rest, restCtrl, moved, movedCtrl, curved, guides, samples
     const out = new Float64Array(2);
     return {
       outline: restFlat,
-      map: (p) => {
-        const w = mvcWeights(p[0], p[1], restFlat);
-        apply(w, out);
-        return Number.isFinite(out[0]) && Number.isFinite(out[1]) ? [out[0], out[1]] : p;
+      locate: (p) => ({ at: p, w: mvcWeights(p[0], p[1], restFlat) }),
+      place: ({ at, w }) => {
+        apply(w!, out);
+        return Number.isFinite(out[0]) && Number.isFinite(out[1]) ? [out[0], out[1]] : at;
       },
+    };
+  }
+
+  /**
+   * The panel as a Coons patch over its four corners, or null if it hasn't
+   * exactly four. A rest point is found on the rest patch (by Newton's method)
+   * and carried to the same spot on the moved one.
+   */
+  function coonsPanel(face: number[], sides: Side[]): Panel | null {
+    const m = face.length, at = (k: number, t: number) => sidePoint(face, sides, k, t, false);
+    const heading = (a: Pt, b: Pt) => Math.atan2(b[1] - a[1], b[0] - a[0]);
+    const corners: number[] = [];
+    for (let k = 0; k < m; k++) {
+      const prev = (k - 1 + m) % m;
+      let turn = Math.abs(heading(at(k, 0), at(k, 0.01)) - heading(at(prev, 0.99), at(prev, 1)));
+      if (turn > Math.PI) turn = 2 * Math.PI - turn;
+      if (turn > CORNER_TURN) corners.push(k);
+    }
+    if (corners.length !== 4) return null;
+
+    // Patch side j runs from corner j to corner j+1 along one or more panel sides,
+    // each taking a share of it by its length on the rest cage.
+    const chains = corners.map((from, j) => {
+      const to = corners[(j + 1) % 4], pieces: number[] = [];
+      for (let k = from; k !== to; k = (k + 1) % m) pieces.push(k);
+      const lengths = pieces.map((k) => {
+        let len = 0;
+        for (let s = 0; s < 8; s++) {
+          const a = at(k, s / 8), b = at(k, (s + 1) / 8);
+          len += Math.hypot(b[0] - a[0], b[1] - a[1]);
+        }
+        return len;
+      });
+      const total = lengths.reduce((a, b) => a + b, 0) || 1;
+      return { pieces, shares: lengths.map((l) => l / total) };
+    });
+    const along = (j: number, s: number, inMoved: boolean): Pt => {
+      const { pieces, shares } = chains[j];
+      for (let i = 0; i < pieces.length; i++) {
+        if (s <= shares[i] || i === pieces.length - 1) return sidePoint(face, sides, pieces[i], shares[i] ? Math.min(1, s / shares[i]) : 0, inMoved);
+        s -= shares[i];
+      }
+      return sidePoint(face, sides, pieces[0], 0, inMoved);
+    };
+    // Sides 0 and 2 run across (u), 1 and 3 down (v); 2 and 3 run backwards.
+    const patch = (inMoved: boolean) => {
+      const c = [0, 1, 2, 3].map((j) => along(j, 0, inMoved));
+      return (u: number, v: number): Pt => {
+        const a = along(0, u, inMoved), b = along(1, v, inMoved), cc = along(2, 1 - u, inMoved), d = along(3, 1 - v, inMoved);
+        const blend = (i: 0 | 1) =>
+          (1 - v) * a[i] + v * cc[i] + (1 - u) * d[i] + u * b[i] -
+          ((1 - u) * (1 - v) * c[0][i] + u * (1 - v) * c[1][i] + u * v * c[2][i] + (1 - u) * v * c[3][i]);
+        return [blend(0), blend(1)];
+      };
+    };
+    const rest = patch(false), moved = patch(true);
+    const restCorners = corners.map((k) => at(k, 0));
+    const size = Math.max(...restCorners.flatMap((p) => restCorners.map((q) => Math.hypot(p[0] - q[0], p[1] - q[1]))));
+    const fallback = mvcPanel(face, sides);
+    return {
+      outline: fallback.outline,
+      locate: (p) => {
+        // Where the patch folds over itself, Newton's method can settle outside it; MVC takes those.
+        const uv = solveFor(rest, p, [0.5, 0.5], 1e-7 * size);
+        const within = (x: number) => x >= -0.02 && x <= 1.02;
+        return uv && within(uv[0]) && within(uv[1]) ? { at: p, uv } : fallback.locate(p);
+      },
+      place: (spot) => (spot.uv ? moved(...spot.uv) : fallback.place(spot)),
     };
   }
 

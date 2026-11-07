@@ -33,7 +33,7 @@
     {max}
     {value}
     {disabled}
-    style:--fill="{((value - min) / (max - min)) * 100}%"
+    style:--fill={(value - min) / (max - min)}
     oninput={(e) => oninput(Number(e.currentTarget.value))}
     ondblclick={() => reset !== undefined && oninput(reset)}
   />
@@ -46,26 +46,29 @@
     gap: 2px;
     font-size: 12px;
   }
+  /* The input itself is the track, inset by half the thumb less the track's
+     rounding, so the thumb's travel (on a wider, invisible track) puts its
+     centre over each rounded end: at either end it covers the end whole, and the
+     fill always reaches its centre. */
   input {
-    --fill: 50%;
+    --fill: 0.5; /* of the way along */
     appearance: none;
-    width: 100%;
-    height: 16px;
-    margin: 0;
-    background: none;
+    box-sizing: border-box;
+    width: calc(100% - 8px);
+    height: 8px;
+    margin: 4px;
+    border: 1px solid var(--line);
+    border-radius: 4px;
+    background: linear-gradient(to right, var(--ink) calc(3px + (100% - 6px) * var(--fill)), transparent 0) no-repeat;
     cursor: pointer;
   }
   input::-webkit-slider-runnable-track {
-    height: 8px;
-    border: 1px solid var(--line);
-    border-radius: 4px;
-    background: linear-gradient(to right, var(--ink) var(--fill), transparent var(--fill));
+    height: 6px;
+    margin: 0 -5px;
   }
   input::-moz-range-track {
     height: 6px;
-    border: 1px solid var(--line);
-    border-radius: 4px;
-    background: linear-gradient(to right, var(--ink) var(--fill), transparent var(--fill));
+    background: none;
   }
   input::-webkit-slider-thumb {
     appearance: none;

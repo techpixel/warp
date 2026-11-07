@@ -52,24 +52,55 @@ export function collectCurves(root) {
  * Non-path shapes are replaced by an equivalent <path>.
  */
 export function warpSvgElement(root, transform) {
-  const doc = root.ownerDocument;
-
   for (const [el, curve] of collectCurves(root)) {
-    const d = pathToString(transform(curve, el), 3);
-
-    if (el.tagName.toLowerCase() === "path") {
-      el.setAttribute("d", d);
-      continue;
-    }
-
-    const replacement = doc.createElementNS("http://www.w3.org/2000/svg", "path");
-    for (const { name, value } of [...el.attributes]) {
-      if (!SHAPE_ATTRS.includes(name)) replacement.setAttribute(name, value);
-    }
-    replacement.setAttribute("d", d);
-    el.replaceWith(replacement);
+    asPath(el).setAttribute("d", pathToString(transform(curve, el), 3));
   }
   return root;
+}
+
+/**
+ * Readies every shape under `root` (in place) for warping again and again:
+ * each becomes a <path>, its curve parsed and split into `n` pieces per cubic
+ * just once. Returns `warp(fn)`, which redraws them all through
+ * `fn([x, y]) => [x, y]` — far quicker per call than warpSvgElement, which
+ * re-parses everything, so large artwork stays draggable.
+ */
+export function prepareWarp(root, n) {
+  const shapes = collectCurves(root).map(([el, curve]) => {
+    const segs = subdivide(curve, n);
+    return {
+      el: asPath(el),
+      cmds: segs.map((s) => s[0]),
+      sizes: segs.map((s) => s.length - 1), // numbers per segment
+      pts: Float64Array.from(segs.flatMap((s) => s.slice(1))),
+    };
+  });
+  // As pathToString(…, 3) rounds.
+  const num = (v) => Math.round(v * 1000) / 1000;
+  return (fn) => {
+    for (const { el, cmds, sizes, pts } of shapes) {
+      let d = "", k = 0;
+      for (let s = 0; s < cmds.length; s++) {
+        d += cmds[s];
+        for (let end = k + sizes[s], sep = ""; k < end; k += 2, sep = " ") {
+          const [x, y] = fn([pts[k], pts[k + 1]]);
+          d += `${sep}${num(x)} ${num(y)}`;
+        }
+      }
+      el.setAttribute("d", d);
+    }
+  };
+}
+
+/** `el`, or an equivalent <path> put in its place. */
+function asPath(el) {
+  if (el.tagName.toLowerCase() === "path") return el;
+  const path = el.ownerDocument.createElementNS("http://www.w3.org/2000/svg", "path");
+  for (const { name, value } of [...el.attributes]) {
+    if (!SHAPE_ATTRS.includes(name)) path.setAttribute(name, value);
+  }
+  el.replaceWith(path);
+  return path;
 }
 
 /** Union bbox of every shape under `root` (ignores `transform` attributes). */
