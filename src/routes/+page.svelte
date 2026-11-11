@@ -125,20 +125,45 @@
     return file;
   }
 
-  // Dragging a pass by its grip moves it up or down the list, a row at a time.
+  // Dragging a pass by its grip carries it anywhere under the pointer; the others
+  // make way as it passes their middles, and it springs back into its slot when let go.
+  // Carried far from the list (sideways, or past its top or bottom), it waves,
+  // more the farther it goes, and settles as it comes back or is let go (see flutter.ts).
   const PASS_STEP = 40; // a row and the gap below it
-  const PAST_END = 128; // how far a pass is pulled past the first or last row before the wave creeps in
-  const SIDEWAYS = 32; // how far it's pulled sideways before it stretches
-  // Tugged where it can't go (sideways, or past the top or bottom of the list,
-  // as a lone pass always is), it gives a little and settles when let go (see flutter.ts).
+  const PAST_END = 128; // how far past the first or last row it's carried before the wave creeps in
+  const SIDEWAYS = 32; // how far it's carried sideways before the wave creeps in
+  const SPRING_BACK = true; // let go, it springs back into its slot (false: put straight back)
+  const SPRING_MS = 700; // let go, it springs back into its slot in this long
+  /**
+   * A soft, well-damped spring (ζ 0.8), sampled into an easing: it reaches its
+   * slot about halfway through, overshoots by about a seventieth, and settles.
+   */
+  const SPRING = `linear(${Array.from({ length: 61 }, (_, i) => {
+    const t = i / 60, w = 10.5, z = 0.8, wd = w * Math.sqrt(1 - z * z);
+    const x = i === 60 ? 1 : 1 - Math.exp(-z * w * t) * (Math.cos(wd * t) + ((z * w) / wd) * Math.sin(wd * t));
+    return x.toFixed(4);
+  }).join(", ")})`;
   /** The pass being dragged to a new spot, by id, which lifts a little meanwhile. */
   let lifted = $state<number | null>(null);
+  /** How far the lifted pass is carried from its slot (px), which it slides back from when let go. */
+  let liftedAt = $state({ x: 0, y: 0 });
   function grabPass(e: PointerEvent, i: number) {
-    let at = i, startY = e.clientY;
+    let at = i, startX = e.clientX, startY = e.clientY;
     const id = passes.list[i]?.id ?? null;
     const grip = e.currentTarget as HTMLElement;
     const pass = grip.closest<HTMLElement>(".pass");
-    const give = pass && EASE_MS ? tug(pass) : null;
+    // Grabbed again before it's home, it's carried on from wherever it's got to.
+    const row = grip.closest<HTMLElement>(".passes > div");
+    const springing = row?.getAnimations().find((a) => a.id === "spring");
+    if (row && springing) {
+      const [x = 0, y = 0] = getComputedStyle(row).translate.split(" ").map(parseFloat);
+      springing.cancel();
+      startX -= x || 0;
+      startY -= y || 0;
+      liftedAt = { x: x || 0, y: y || 0 };
+      lifted = id;
+    }
+    const give = pass && EASE_MS ? tug(pass, grip) : null;
     passes.select(i);
     // Captured, so the drag keeps every move until the button comes up, wherever the pointer
     // goes. Reordering can move the grip's own node, which drops the capture, so it's taken
@@ -151,17 +176,21 @@
       if (ev.pointerId !== e.pointerId) return;
       const last = passes.list.length - 1;
       const dy = ev.clientY - startY;
-      const pastEnd = at === 0 && dy < -PAST_END ? dy + PAST_END : at === last && dy > PAST_END ? dy - PAST_END : 0;
-      const sideways = Math.max(0, Math.abs(ev.clientX - e.clientX) - SIDEWAYS);
+      if (Math.hypot(ev.clientX - e.clientX, ev.clientY - e.clientY) > 4) lifted = id;
+      const to = Math.max(0, Math.min(last, at + Math.round(dy / PASS_STEP)));
+      if (to !== at) {
+        passes.move(at, to);
+        startY += (to - at) * PASS_STEP;
+        at = to;
+        tick().then(capture);
+      }
+      liftedAt = { x: ev.clientX - startX, y: ev.clientY - startY };
+      // Past the first or last slot, by however far it's carried beyond PAST_END.
+      const above = -at * PASS_STEP - PAST_END, below = (last - at) * PASS_STEP + PAST_END;
+      const pastEnd = liftedAt.y < above ? liftedAt.y - above : liftedAt.y > below ? liftedAt.y - below : 0;
+      const sideways = Math.max(0, Math.abs(liftedAt.x) - SIDEWAYS);
       if (sideways || pastEnd) give?.pull(sideways, pastEnd);
       else give?.release();
-      if (last > 0 && Math.abs(ev.clientY - e.clientY) > 4) lifted = id;
-      const to = Math.max(0, Math.min(last, at + Math.round(dy / PASS_STEP)));
-      if (to === at) return;
-      passes.move(at, to);
-      startY += (to - at) * PASS_STEP;
-      at = to;
-      tick().then(capture);
     };
     window.addEventListener("pointermove", move);
     // Captured above (and again after each reorder), so `hold` doesn't capture or end on losing it.
@@ -169,7 +198,15 @@
       window.removeEventListener("pointermove", move);
       if (grip.hasPointerCapture(e.pointerId)) grip.releasePointerCapture(e.pointerId);
       give?.release();
+      const from = liftedAt;
       lifted = null;
+      liftedAt = { x: 0, y: 0 };
+      if (SPRING_BACK && row && EASE_MS && (from.x || from.y)) {
+        // Still above everything until it's home.
+        row.style.zIndex = "30";
+        const back = row.animate([{ translate: `${from.x}px ${from.y}px` }, { translate: "0 0" }], { id: "spring", duration: SPRING_MS, easing: SPRING });
+        back.onfinish = back.oncancel = () => (row.style.zIndex = "");
+      }
     }, false);
   }
 
@@ -205,7 +242,7 @@
 />
 
 <div class="app">
-  <aside>
+  <aside class={{ carrying: lifted !== null }}>
     <div class="top">
       <header>
         <Logo />
@@ -226,10 +263,12 @@
       <div class="passes" role="listbox" aria-label="Warp passes">
         {#each passes.list as pass, i (pass.id)}
           <!-- Scales in when added, and back out when deleted; the others slide into place.
-               Lifts a little while it's dragged to a new spot. -->
+               Lifts a little and follows the pointer while it's dragged to a new spot
+               (no flip for it then: it's already where the pointer put it). -->
           <div
             class={{ lifted: lifted === pass.id }}
-            animate:flip={{ duration: EASE_MS, easing: cubicOut }}
+            style:translate={lifted === pass.id ? `${liftedAt.x}px ${liftedAt.y}px` : null}
+            animate:flip={{ duration: lifted === pass.id ? 0 : EASE_MS, easing: cubicOut }}
             transition:scale={{ start: 0.8, duration: EASE_MS, easing: cubicOut }}
           >
             <WarpPass
@@ -237,6 +276,7 @@
               color={pass.editor.method?.color ?? "#5549ff"}
               onColor={pass.editor.method?.onColor ?? "#fff"}
               selected={passes.active === i}
+              carried={lifted === pass.id}
               removable={passes.list.length > 1}
               onselect={() => passes.select(i)}
               onremove={() => passes.remove(i)}
@@ -506,6 +546,10 @@
     background: var(--panel);
     border-radius: 0 16px 16px 0;
   }
+  /* A pass carried out of the sidebar stays visible over the canvas. */
+  aside.carrying {
+    overflow: visible;
+  }
   /* The top (the passes) always shows in full; when the window is too short,
      the settings below it give way and scroll instead. */
   .top {
@@ -552,10 +596,12 @@
     position: relative;
     transition: scale var(--ease);
   }
-  /* Above the others, as it's carried over them. */
+  /* Above everything, as it's carried over it, right under the pointer
+     (it springs back into its slot when let go; see grabPass). */
   .passes > .lifted {
-    z-index: 1;
+    z-index: 30;
     scale: 1.03;
+    transform-origin: calc(100% - 16px) 50%; /* the grip, which stays under the pointer */
   }
   .actions {
     display: flex;

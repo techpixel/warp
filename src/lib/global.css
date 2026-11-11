@@ -1,6 +1,6 @@
 /* Page-wide tokens and base styles, shared by the site and the Figma plugin. */
 :root {
-  --bg: #131313;
+  --bg: #1c1c1c;
   --panel: #000;
   --ink: #fff;
   --line: #fff;
@@ -24,6 +24,8 @@ html,
 body {
   height: 100%;
   margin: 0;
+  /* The app fills the window exactly; a pass dragged past its edge mustn't make it scroll. */
+  overflow: hidden;
 }
 body {
   background-color: var(--bg);

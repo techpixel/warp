@@ -1,6 +1,7 @@
 <!--
   One warp pass in the sidebar's list: filled while selected, outlined
-  otherwise, with a delete button and a grip to drag it up or down the list.
+  otherwise, with a delete button and a grip to drag it around the list
+  (outlined in black meanwhile, so it reads over anything it's carried across).
 -->
 <script lang="ts">
 
@@ -9,6 +10,7 @@
     color,
     onColor,
     selected,
+    carried = false,
     removable,
     onselect,
     onremove,
@@ -19,6 +21,8 @@
     color: string;
     onColor: string;
     selected: boolean;
+    /** Being dragged by its grip. */
+    carried?: boolean;
     /** False for the only pass, which can't be deleted. */
     removable: boolean;
     onselect: () => void;
@@ -29,7 +33,7 @@
 </script>
 
 <div
-  class={["pass", { selected }]}
+  class={["pass", { selected, carried }]}
   style:--pass-color={color}
   style:--pass-on={onColor}
   role="option"
@@ -113,6 +117,9 @@
   }
   .selected .delete:hover:not(:disabled) {
     background: color-mix(in srgb, var(--pass-on) 20%, transparent);
+  }
+  .carried {
+    outline: 1px solid #000;
   }
   .pass:focus-visible {
     outline: 2px solid var(--focus);
