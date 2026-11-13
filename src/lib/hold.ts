@@ -11,8 +11,10 @@
 export function hold(el: Element, e: PointerEvent, end: () => void, capture = true) {
   const signals = ["pointerup", "mouseup", "pointercancel", "pointerdown", "blur"];
   let over = false;
-  const done = () => {
-    if (over) return;
+  const done = (ev?: Event) => {
+    // Caught on the way down, a control losing focus (as this press takes it) is a blur too; only the window's counts.
+    console.log("[warp:hold] signal", ev?.type, (ev?.target as Element)?.nodeName ?? ev?.target, "buttons" in (ev ?? {}) ? (ev as PointerEvent).buttons : "", { over }); // DEBUG
+    if (over || (ev?.type === "blur" && ev.target !== window)) return;
     over = true;
     for (const s of signals) window.removeEventListener(s, done, true);
     window.removeEventListener("pointermove", idle, true);

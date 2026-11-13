@@ -29,6 +29,8 @@ export function requestSelection() {
  * instead of downloading.
  */
 export function connectFigma(load: (file: File) => void, onReady: (ready: boolean) => void) {
+  console.log("[warp] debug logging on"); // DEBUG
+  window.addEventListener("pointerdown", (e) => console.log("[warp:press] hit", (e.target as Element)?.nodeName, (e.target as Element)?.getAttribute?.("class"), document.activeElement?.nodeName), true); // DEBUG
   window.addEventListener("message", (e: MessageEvent) => {
     const msg = e.data?.pluginMessage as FromPlugin | undefined;
     if (msg?.type === "ready") return onReady(msg.ready);

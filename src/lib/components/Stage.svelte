@@ -393,6 +393,7 @@
 
 
   function grab(e: PointerEvent, i: number) {
+    console.log("[warp:grab] press", i, { button: e.button, selected: editor.selected, editing: editor.editing, points: points.length }); // DEBUG
     if (e.button !== 0) return;
     e.stopPropagation();
     if (e.altKey && editor.editing) return editor.removeVertex(i);
@@ -401,6 +402,7 @@
     const now = performance.now(), last = lastPress;
     lastPress = { i, at: now, x: e.clientX, y: e.clientY };
     if (editor.editing && last?.i === i && now - last.at < 400 && Math.hypot(e.clientX - last.x, e.clientY - last.y) < 6) {
+      console.log("[warp:grab] treated as double-click, no drag"); // DEBUG
       lastPress = null;
       editor.select(i, false);
       if (editor.linkFrom === i) startLink(i);
@@ -409,23 +411,49 @@
     // Shift toggles the point in the selection; grabbing an unselected point selects just it.
     if (e.shiftKey) editor.select(i, true);
     else if (!editor.selected.includes(i)) editor.select(i, false);
-    if (!editor.selected.includes(i)) return;
+    if (!editor.selected.includes(i)) return void console.log("[warp:grab] not selected, no drag"); // DEBUG
     const handle = e.currentTarget as SVGCircleElement;
     const [x, y] = toSvg(e), p = points[i];
     const offset: Pt = [p[0] - x, p[1] - y];
     const moving = new Set(editor.dragGroup(i));
     let dragging = false;
+    // DEBUG: tells apart "moves stop arriving" / "moves arrive but are slow" / "moves arrive, nothing redraws".
+    const dbg = { t0: performance.now(), handleMoves: 0, winMoves: 0, lastHandle: 0, lastWin: 0, slowest: 0, total: 0, gaps: [] as number[], frames: 0, lastWinButtons: -1, lost: 0, captured: () => handle.hasPointerCapture(e.pointerId) };
+    const winMove = (ev: PointerEvent) => { // DEBUG
+      const now = performance.now();
+      if (dbg.lastWin && now - dbg.lastWin > 150) dbg.gaps.push(Math.round(now - dbg.lastWin));
+      dbg.winMoves++, (dbg.lastWin = now), (dbg.lastWinButtons = ev.buttons);
+    };
+    window.addEventListener("pointermove", winMove, true); // DEBUG
+    let raf = requestAnimationFrame(function frame() { dbg.frames++; raf = requestAnimationFrame(frame); }); // DEBUG
     const move = (ev: PointerEvent) => {
+      dbg.handleMoves++, (dbg.lastHandle = performance.now()); // DEBUG
       // Starts once the pointer has moved a few screen pixels, so a click doesn't snap the point.
       if (!dragging && Math.hypot(ev.clientX - e.clientX, ev.clientY - e.clientY) < 3) return;
+      if (!dragging) console.log("[warp:grab] moving"); // DEBUG
       dragging = true;
       const [mx, my] = toSvg(ev);
-      editor.dragPoint(i, snap(i, [mx + offset[0], my + offset[1]], moving));
+      const t = performance.now(); // DEBUG
+      try { editor.dragPoint(i, snap(i, [mx + offset[0], my + offset[1]], moving)); } catch (err) { console.error("[warp:grab] dragPoint threw", err); } // DEBUG
+      const dt = performance.now() - t; // DEBUG
+      (dbg.total += dt), (dbg.slowest = Math.max(dbg.slowest, dt)); // DEBUG
     };
+    console.log("[warp:grab] drag start", i, { offset, captured: dbg.captured() }); // DEBUG
+    handle.addEventListener("lostpointercapture", () => (dbg.lost = performance.now()), { once: true }); // DEBUG
     handle.addEventListener("pointermove", move);
     hold(handle, e, () => {
       handle.removeEventListener("pointermove", move);
       align = [];
+      window.removeEventListener("pointermove", winMove, true); // DEBUG
+      cancelAnimationFrame(raf); // DEBUG
+      const end = performance.now(), dur = end - dbg.t0; // DEBUG
+      console.log("[warp:grab] drag end", JSON.stringify({ // DEBUG
+        ms: Math.round(dur), handleMoves: dbg.handleMoves, winMoves: dbg.winMoves,
+        msSinceLastHandleMove: Math.round(end - dbg.lastHandle), msSinceLastWinMove: Math.round(end - dbg.lastWin),
+        lastWinButtons: dbg.lastWinButtons, gapsOver150ms: dbg.gaps,
+        dragPointAvgMs: +(dbg.total / Math.max(1, dbg.handleMoves)).toFixed(1), dragPointMaxMs: +dbg.slowest.toFixed(1),
+        fps: Math.round((dbg.frames * 1000) / dur), captureLostMsBeforeEnd: dbg.lost ? Math.round(end - dbg.lost) : null,
+      })); // DEBUG
     });
   }
 
